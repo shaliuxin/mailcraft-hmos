@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "MailCraft minimal OpenHarmony link" },
+    { "name": "EntryAbility_desc", "value": "MailCraft core bridge entry" },
+    { "name": "EntryAbility_label", "value": "MailCraft" },
+    { "name": "app_name", "value": "MailCraft" },
+    { "name": "internet_permission_reason", "value": "to reach IMAP/SMTP/mail servers" }
+  ]
+}

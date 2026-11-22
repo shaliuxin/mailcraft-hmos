@@ -1,0 +1,12 @@
+{
+  "app": {
+    "bundleName": "cn.shaliuxin.mailcraft",
+    "vendor": "shaliuxin",
+    "versionCode": 1400,
+    "versionName": "0.14.0",
+    "buildVersion": "1",
+    "cloudFileSyncEnabled": true,
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}

@@ -1,0 +1,54 @@
+# Standalone bridge crate (NOT a workspace member): it keeps the Rust core's
+# `Session`/command registry out of the layering checks and lets the HarmonyOS
+# NAPI shim drive the core through a plain C ABI. Owns its own lock file.
+[package]
+name = "mailcraft-ohos-bridge"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[workspace]
+
+[dependencies]
+mailcraft-engine = { path = "../../crates/engine" }
+mailcraft-host = { path = "../../crates/host" }
+mailcraft-time = { path = "../../crates/time" }
+# Real IMAP/SMTP "test connection": the Account model and the net crate that opens the (TLS)
+# IMAP/SMTP socket. mailcraft-net is the CA task's payoff — on OHOS it verifies server certs with
+# the webpki-roots verifier built in crates/net/src/tls.rs.
+mailcraft-model = { path = "../../crates/model" }
+mailcraft-net = { path = "../../crates/net" }
+serde_json = "1"
+
+# ---- P1c: egui UI rendering backend (OHOS path) ----
+# Mirror the anicraft-hmos / solidcraft-hmos native layer: on OHOS the app drives the
+# original `mailcraft-ui-egui::MailApp::logic(ctx)` frame loop itself, bypassing eframe/winit,
+# rendering egui through egui-wgpu onto an OHOS GL/EGL surface via wgpu's gles backend.
+# egui 0.37 pulls wgpu 30.0.1 / wgpu-hal 30.0.1 (same as the desktop app), and the OHOS
+# gles backend needs the uniform-block wgpu-hal patch (see native/third_party/wgpu-hal-30.0.1).
+egui = { version = "0.37", features = ["bytemuck", "default_fonts"] }
+egui-wgpu = "0.37"
+# The real MailCraft UI (Outlook-style ribbon, inbox, compose…). P1c-1b drives the original
+# `MailApp::logic` / `MailApp::ui` on the render thread instead of the placeholder labels.
+mailcraft-ui-egui = { path = "../../crates/ui-egui" }
+# gles is the only backend OHOS's native toolchain exposes; desktop uses the default (DX12/Metal).
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "gles"] }
+pollster = "1"
+raw-window-handle = "0.6"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+
+# Host smoke binary: drives the bridge's C ABI entry points against the sample mailbox.
+[[bin]]
+name = "smoke"
+path = "smoke.rs"
+
+[patch.crates-io]
+# The OHOS gles backend needs a uniform-block fix in wgpu-hal; use the validated 30.0.1 patch.
+# The patch path is relative to this (non-workspace) crate's manifest.
+wgpu-hal = { path = "../third_party/wgpu-hal-30.0.1" }
+

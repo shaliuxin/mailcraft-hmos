@@ -1,0 +1,16 @@
+# OHOS cross-compile for the bridge (mirrors mailcraft/.cargo/config.toml OHOS section).
+[target.aarch64-unknown-linux-ohos]
+ar = "C:/ohos-sdk/default/openharmony/native/llvm/bin/llvm-ar.exe"
+linker = "C:/ohos-sdk/default/openharmony/native/llvm/bin/clang.exe"
+rustflags = [
+    "-Clink-arg=--target=aarch64-linux-ohos",
+    "-Clink-arg=--sysroot=C:/ohos-sdk/default/openharmony/native/sysroot",
+]
+
+[env]
+LIBCLANG_PATH = "C:/ohos-sdk/default/openharmony/native/llvm/lib"
+CC_aarch64_unknown_linux_ohos = "C:/ohos-sdk/default/openharmony/native/llvm/bin/clang.exe"
+AR_aarch64_unknown_linux_ohos = "C:/ohos-sdk/default/openharmony/native/llvm/bin/llvm-ar.exe"
+CXX_aarch64_unknown_linux_ohos = "C:/ohos-sdk/default/openharmony/native/llvm/bin/clang++.exe"
+CFLAGS_aarch64_unknown_linux_ohos = "--target=aarch64-linux-ohos --sysroot=C:/ohos-sdk/default/openharmony/native/sysroot"
+CXXFLAGS_aarch64_unknown_linux_ohos = "--target=aarch64-linux-ohos --sysroot=C:/ohos-sdk/default/openharmony/native/sysroot"

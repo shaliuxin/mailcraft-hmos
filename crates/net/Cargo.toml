@@ -1,0 +1,68 @@
+[package]
+name = "mailcraft-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MailCraft network transport for the desktop app and CLI: TLS sockets, sending through SMTP, synchronising with IMAP, OAuth sign-in, MX lookup (empty on wasm: a browser can't open sockets)"
+
+[lints]
+workspace = true
+
+[dependencies]
+mailcraft-time = { workspace = true }
+mailcraft-model = { workspace = true }
+mailcraft-mime = { workspace = true }
+mailcraft-mime-model = { workspace = true }
+mailcraft-proto = { workspace = true }
+mailcraft-i18n = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+# A picture that a web server sends packed although nobody asked it to (`Content-Encoding: gzip`)
+# is unpacked: in Rust all the way down, and already in the tree (the PNG decoder runs on it).
+flate2 = { workspace = true }
+# The OAuth sign-in: the token endpoint answers in JSON, and PKCE takes random bytes, SHA-256
+# (ring, which rustls runs on) and base64 (`mailcraft-charset`).
+serde_json = { workspace = true }
+mailcraft-charset = { workspace = true }
+ring = { workspace = true }
+# The Favorites of Outlook come inside an XML document (`graph::favorites`): read by a reader
+# that takes no DTD and expands no entity.
+quick-xml = { workspace = true }
+
+# The authorities Windows trusts for secure mail (#30, `anchors`): its certificate store, through
+# the safe wrapper rustls already brings there. MIT.
+[target.'cfg(windows)'.dependencies]
+schannel = { workspace = true }
+
+# The roots Mozilla trusts for mail in NSS's own list (`libnssckbi.so`), where the system extracts
+# no bundle for mail (#30, `anchors_nss`): Debian, Ubuntu, Linux Mint, FreeBSD. The same PKCS#11
+# binding the desktop app reads tokens with (Apache-2.0); loading the module and calling it are
+# its unsafe, behind a safe API.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+cryptoki = "0.12.1"
+
+# OpenHarmony has no system CA store that rustls-platform-verifier can read, so on that target we
+# ship Mozilla's roots (webpki-roots, already in the tree via rustls-webpki) and verify with
+# rustls's own WebPkiVerifier (`tls.rs`). 0.26 pairs with rustls 0.23 / rustls-pki-types 1.x.
+[target.'cfg(target_env = "ohos")'.dependencies]
+webpki-roots = "0.26"
+
+[features]
+# A stand-in for Microsoft Graph that holds a client to the documented contract
+# (`graph::standin`), for the tests of the crates that sit on this one. Never in a build that isn't a test's.
+stand-in = []
+
+# The stand-in as a server on loopback, for host tests (`examples/standin.rs`).
+[[example]]
+name = "standin"
+required-features = ["stand-in"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Runtime-generated certificates for the loopback STARTTLS fake only.
+rcgen = { workspace = true }

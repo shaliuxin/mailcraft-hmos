@@ -1,0 +1,64 @@
+// Signing material placeholder: fill with a fresh DevEco auto-signing profile bound to
+// the THIS project's bundleName (cn.shaliuxin.mailcraft) — never reuse another project's.
+//
+// Before assembling the HAP, copy your real profile into build-profile.json5:
+//     cp build-profile.local.json5 build-profile.json5
+// and keep build-profile.local.json5 (real cert / profile / p12 + passwords) OUT of git.
+// The ${OHOS_SIGN_*} tokens below are replaced from build-profile.local.json5 locally.
+{
+  app: {
+    signingConfigs: [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "${OHOS_SIGN_CERT}",
+          "keyAlias": "debugKey",
+          "keyPassword": "${OHOS_SIGN_KEY_PASSWORD}",
+          "profile": "${OHOS_SIGN_PROFILE}",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "${OHOS_SIGN_STORE}",
+          "storePassword": "${OHOS_SIGN_STORE_PASSWORD}"
+        }
+      }
+    ],
+    products: [
+      {
+        name: 'default',
+        targetSdkVersion: '26.0.0',
+        compatibleSdkVersion: '26.0.0',
+        runtimeOS: 'HarmonyOS',
+        buildOption: {
+          nativeCompiler: 'BiSheng',
+          strictMode: {
+            caseSensitiveCheck: true,
+            useNormalizedOHMUrl: true,
+          },
+        },
+        signingConfig: 'default',
+      },
+    ],
+    buildModeSet: [
+      {
+        name: 'debug',
+      },
+      {
+        name: 'release',
+      },
+    ],
+  },
+  modules: [
+    {
+      name: 'entry',
+      srcPath: './entry',
+      targets: [
+        {
+          name: 'default',
+          applyToProducts: [
+            'default',
+          ],
+        },
+      ],
+    },
+  ],
+}
