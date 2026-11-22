@@ -50,7 +50,7 @@ cryptoki = "0.12.1"
 # ship Mozilla's roots (webpki-roots, already in the tree via rustls-webpki) and verify with
 # rustls's own WebPkiVerifier (`tls.rs`). 0.26 pairs with rustls 0.23 / rustls-pki-types 1.x.
 [target.'cfg(target_env = "ohos")'.dependencies]
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 [features]
 # A stand-in for Microsoft Graph that holds a client to the documented contract
