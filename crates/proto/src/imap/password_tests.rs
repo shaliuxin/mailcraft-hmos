@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: MailCraft contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+use super::*;
+use crate::script::Script;
+
+fn greeting(caps: &str, replies: &str) -> String {
+    format!("* OK [CAPABILITY IMAP4rev1 {caps}] ready\r\n{replies}")
+}
+
+#[test]
+fn plain_uses_an_initial_response_only_when_advertised() {
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    for inline in [false, true] {
+        let caps = if inline { "AUTH=PLAIN SASL-IR LOGINDISABLED" } else { "AUTH=PLAIN LOGINDISABLED" };
+        let replies = if inline {
+            "A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR LOGINDISABLED] welcome\r\n"
+        } else {
+            "+ continue\r\nA0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR LOGINDISABLED] welcome\r\n"
+        };
+        let mut stream = Script::new(greeting(caps, replies));
+        let mut imap = Imap::connect(&mut stream).unwrap();
+        imap.authenticate_password("user@example.org", "invented").unwrap();
+        assert!(imap.is_authenticated());
+        let expected = if inline { format!("A0001 AUTHENTICATE PLAIN {payload}\r\n") } else { format!("A0001 AUTHENTICATE PLAIN\r\n{payload}\r\n") };
+        assert_eq!(stream.sent(), expected);
+    }
+}
+
+#[test]
+fn login_remains_available_when_plain_is_not_advertised() {
+    let mut stream = Script::new(greeting("SASL-IR", "A0001 OK [CAPABILITY IMAP4rev1 SASL-IR] welcome\r\n"));
+    Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").unwrap();
+    assert_eq!(stream.sent(), "A0001 LOGIN \"user@example.org\" \"invented\"\r\n");
+}
+
+#[test]
+fn a_plain_refusal_is_redacted_and_never_retried_with_login() {
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    let mut stream = Script::new(greeting("AUTH=PLAIN SASL-IR", &format!("A0001 NO [AUTHENTICATIONFAILED] invented {payload}\r\n")));
+    let mut imap = Imap::connect(&mut stream).unwrap();
+    let error = imap.authenticate_password("user@example.org", "invented").unwrap_err();
+    assert!(matches!(error, ProtoError::Auth(_)));
+    assert!(!format!("{error:?} {imap:?}").contains("invented"));
+    assert!(!format!("{error:?} {imap:?}").contains(&payload));
+    assert!(!imap.is_authenticated());
+    assert!(!stream.sent().contains(" LOGIN "));
+}
+
+#[test]
+fn a_refusal_before_the_challenge_sends_no_password() {
+    let mut stream = Script::new(greeting("AUTH=PLAIN", "A0001 NO unavailable\r\n"));
+    assert!(Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").is_err());
+    assert_eq!(stream.sent(), "A0001 AUTHENTICATE PLAIN\r\n");
+}
+
+#[test]
+fn repeated_challenges_cancel_and_never_authenticate() {
+    for replies in ["+ first\r\n+ second\r\nA0001 OK ignored\r\n", "+ first\r\n+ second\r\n+ third\r\n"] {
+        let mut stream = Script::new(greeting("AUTH=PLAIN", replies));
+        let mut imap = Imap::connect(&mut stream).unwrap();
+        assert!(imap.authenticate_password("user@example.org", "invented").is_err());
+        assert!(!imap.is_authenticated());
+        assert!(stream.sent().ends_with("\r\n*\r\n"));
+    }
+}
+
+#[test]
+fn premature_success_and_invalid_credentials_are_refused() {
+    let mut stream = Script::new(greeting("AUTH=PLAIN", "A0001 OK too early\r\n"));
+    assert!(Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").is_err());
+    for (user, password) in [("", "invented"), ("user@example.org", ""), ("bad\0user", "invented"), ("user@example.org", "bad\0password")] {
+        let mut stream = Script::new(greeting("AUTH=PLAIN", ""));
+        assert!(Imap::connect(&mut stream).unwrap().authenticate_password(user, password).is_err());
+        assert!(stream.sent().is_empty());
+    }
+    let mut stream = Script::new(greeting("AUTH=PLAIN", ""));
+    assert!(Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", &"x".repeat(32769)).is_err());
+    assert!(stream.sent().is_empty());
+}
+
+#[test]
+fn utf8_and_line_breaks_are_encoded_not_protocol_lines() {
+    let mut stream = Script::new(greeting("auth=plain sasl-ir", "A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] welcome\r\n"));
+    Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "päss\r\nword").unwrap();
+    assert_eq!(stream.sent().lines().count(), 1);
+    assert!(stream.sent().contains(&mailcraft_charset::base64::STANDARD.encode("\0user@example.org\0päss\r\nword".as_bytes())));
+}
+
+#[test]
+fn unknown_capabilities_are_queried_once_by_password_authentication() {
+    let mut stream = Script::new(
+        "* OK ready\r\n* CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR\r\nA0001 OK done\r\nA0002 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] welcome\r\n",
+    );
+    Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").unwrap();
+    assert!(stream.sent().starts_with("A0001 CAPABILITY\r\nA0002 AUTHENTICATE PLAIN "));
+    assert_eq!(stream.sent().matches(" CAPABILITY").count(), 1);
+}
+#[test]
+fn a_missing_password_has_its_own_message_without_network_commands() {
+    let mut stream = Script::new("* OK ready\r\n");
+    let error = Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "").unwrap_err();
+    assert!(error.to_string().contains("enter a password"));
+    assert!(!error.to_string().contains("NUL"));
+    assert!(stream.sent().is_empty());
+}
+
+#[test]
+fn an_empty_user_name_is_explained_before_any_commands() {
+    for text in ["* OK ready\r\n".to_string(), greeting("AUTH=PLAIN", ""), greeting("", "")] {
+        let mut stream = Script::new(text);
+        let error = Imap::connect(&mut stream).unwrap().authenticate_password("", "invented").unwrap_err();
+        assert!(error.to_string().contains("enter a user name"));
+        assert!(!error.to_string().contains("NUL"));
+        assert!(stream.sent().is_empty());
+    }
+}
+
+/// #1147: the server that offers `ID` (RFC 2971) is told which client this is once the owner is
+/// signed in, as Coremail's servers need before they will open a mailbox.
+#[test]
+fn a_server_that_offers_id_is_told_which_client_this_is() {
+    let id = "(\"name\" \"MailCraft\")";
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    let mut stream =
+        Script::new(greeting("AUTH=PLAIN SASL-IR ID", "A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR ID] welcome\r\nA0002 OK ID done\r\n"));
+    let mut imap = Imap::connect(&mut stream).unwrap();
+    imap.authenticate_password("user@example.org", "invented").unwrap();
+    assert!(imap.is_authenticated());
+    assert_eq!(stream.sent(), format!("A0001 AUTHENTICATE PLAIN {payload}\r\nA0002 ID {id}\r\n"));
+    assert!(stream.finished());
+}
+
+#[test]
+fn login_falls_back_then_tells_the_server_which_client_this_is() {
+    let mut stream = Script::new(greeting("ID", "A0001 OK [CAPABILITY IMAP4rev1 ID] welcome\r\nA0002 OK ID done\r\n"));
+    Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").unwrap();
+    assert_eq!(stream.sent(), "A0001 LOGIN \"user@example.org\" \"invented\"\r\nA0002 ID (\"name\" \"MailCraft\")\r\n");
+}
+
+#[test]
+fn a_refused_id_command_still_leaves_the_owner_signed_in() {
+    for refusal in ["NO not now", "BAD what"] {
+        let mut stream = Script::new(greeting(
+            "AUTH=PLAIN SASL-IR ID",
+            &format!("A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR ID] welcome\r\nA0002 {refusal}\r\n"),
+        ));
+        let mut imap = Imap::connect(&mut stream).unwrap();
+        imap.authenticate_password("user@example.org", "invented").unwrap();
+        assert!(imap.is_authenticated(), "{refusal}");
+        assert!(stream.sent().contains("A0002 ID ("), "{refusal}");
+    }
+}
+
+/// #1147: `ID` is a courtesy, so a server that answers it with something that isn't an IMAP
+/// response leaves the owner signed in all the same, as one that refuses it does.
+#[test]
+fn an_id_exchange_that_fails_still_leaves_the_owner_signed_in() {
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    let mut stream = Script::new(greeting(
+        "AUTH=PLAIN SASL-IR ID",
+        "A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR ID] welcome\r\nthis is not an IMAP response\r\n",
+    ));
+    let mut imap = Imap::connect(&mut stream).unwrap();
+    imap.authenticate_password("user@example.org", "invented").unwrap();
+    assert!(imap.is_authenticated());
+    assert_eq!(stream.sent(), format!("A0001 AUTHENTICATE PLAIN {payload}\r\nA0002 ID (\"name\" \"MailCraft\")\r\n"));
+}
+
+/// #1147: the capabilities asked for after a sign-in that didn't restate them are a step towards
+/// `ID`, and a server that fails them still leaves the owner signed in.
+#[test]
+fn a_failed_capability_query_after_sign_in_still_leaves_the_owner_signed_in() {
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    let mut stream =
+        Script::new("* CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR\r\nA0001 OK done\r\nA0002 OK welcome\r\nthis is not an IMAP response\r\n");
+    let mut imap = Imap::resume(&mut stream);
+    imap.authenticate_password("user@example.org", "invented").unwrap();
+    assert!(imap.is_authenticated());
+    assert_eq!(stream.sent(), format!("A0001 CAPABILITY\r\nA0002 AUTHENTICATE PLAIN {payload}\r\nA0003 CAPABILITY\r\n"));
+}
+
+/// #1147: a server that offers `ID` only once the owner is signed in is asked what it can do
+/// after the sign-in, even when the greeting had said already (RFC 3501 §6.2.1: the list can
+/// differ once signed in).
+#[test]
+fn a_server_that_offers_id_only_when_signed_in_is_asked_again_and_told_which_client_this_is() {
+    let payload = mailcraft_charset::base64::STANDARD.encode(b"\0user@example.org\0invented");
+    let mut stream =
+        Script::new(greeting("AUTH=PLAIN SASL-IR", "A0001 OK welcome\r\n* CAPABILITY IMAP4rev1 ID\r\nA0002 OK done\r\nA0003 OK ID done\r\n"));
+    let mut imap = Imap::connect(&mut stream).unwrap();
+    imap.authenticate_password("user@example.org", "invented").unwrap();
+    assert!(imap.is_authenticated());
+    assert_eq!(stream.sent(), format!("A0001 AUTHENTICATE PLAIN {payload}\r\nA0002 CAPABILITY\r\nA0003 ID (\"name\" \"MailCraft\")\r\n"));
+}
+
+#[test]
+fn a_server_without_id_is_sent_no_id_command() {
+    for caps in ["AUTH=PLAIN SASL-IR", "AUTH=PLAIN"] {
+        let replies = if caps.ends_with("SASL-IR") {
+            "A0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] welcome\r\n"
+        } else {
+            "+ continue\r\nA0001 OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] welcome\r\n"
+        };
+        let mut stream = Script::new(greeting(caps, replies));
+        Imap::connect(&mut stream).unwrap().authenticate_password("user@example.org", "invented").unwrap();
+        assert!(!stream.sent().contains(" ID "), "{caps}: {}", stream.sent());
+        assert!(stream.finished());
+    }
+}

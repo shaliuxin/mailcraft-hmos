@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "0.15.0",
+  "description": "MailCraft entry module",
+  "main": "Index.ets",
+  "author": "shaliuxin",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "libentry.so": "file:./src/main/cpp/types/libentry"
+  }
+}

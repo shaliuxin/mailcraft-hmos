@@ -1,0 +1,10 @@
+{
+  "name": "mailcraft-ohos",
+  "modelVersion": "26.0.0",
+  "version": "0.15.0",
+  "description": "MailCraft minimal OpenHarmony link",
+  "main": "",
+  "author": "shaliuxin",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {}
+}

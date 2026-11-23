@@ -1,0 +1,3879 @@
+// SPDX-FileCopyrightText: MailCraft contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! What an agent may do (MCP, headless or bridged to the app): every command is classified, a
+//! command that isn't is refused, and what reaches other people, deletes for good, touches the
+//! accounts, the mailbox file or the options waits for the owner.
+//!
+//! Message text is data, never instructions: whatever an agent reads in a message may have been
+//! written to make it do something. So the gate doesn't trust the agent, only the owner:
+//! - [`access`] is each command's class, by id (the engine's commands and the window's `ui.*`).
+//!   No class: refused. New commands must choose (a test holds every registered id to it).
+//! - [`classify`] adds what only the params and the mailbox can tell (`"send": true`, a move into
+//!   the Outbox, a delete in Deleted Items).
+//! - No file on disk is named by an agent: [`file_param`] finds the params that name one, and
+//!   [`check`] refuses them. (`mailcraft-cli mcp --files DIR` reads and writes inside DIR itself
+//!   and hands the command `data`.)
+//! - [`Session::run`](crate::Session::run) checks what a command did while [`Session::agent`] is
+//!   set: mail put in an Outbox (which sends it, or, an IMAP account's, holds it for Send Again)
+//!   or gone for good without the grant is undone.
+
+use mailcraft_model::{FolderKind, Id, Mailbox, Task};
+use serde_json::{Value, json};
+
+pub mod bind;
+#[cfg(test)]
+mod delete_form_tests;
+
+use crate::cmd::compose::{LEAVING, draft_gone};
+use crate::{Session, p};
+
+/// What needs the owner, by kind. `--allow <class>` names them, but for [`Class::Leave`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Class {
+    /// Writes to anybody (sends mail, answers or forwards meetings, puts mail in the Outbox or on
+    /// another account's server) or reaches out to the web for a message (its pictures, a
+    /// meeting's link).
+    Send,
+    /// Deletes for good (or throws away what an agent wrote in a message and didn't save; what
+    /// the owner wrote is [`Access::Asked`] about, #494).
+    Delete,
+    /// Closes the message the owner is writing, or puts another in its place, when the owner has
+    /// changes in it that aren't saved; they go to Drafts first (#494). Asked every time: no
+    /// `--allow` names it, as the owner leaves their message themselves when they mean to.
+    Leave,
+    /// Accounts, sign-ins, the application id, what is remembered of them.
+    Accounts,
+    /// Opens, replaces or saves the mailbox file.
+    Mailbox,
+    /// Options, signatures, rules, the Safe and Blocked Senders lists, picture download settings.
+    Settings,
+    /// Raw pointer and keyboard input into the window (anything, including Send). Never asked
+    /// about: only `--allow input` lets it through.
+    Input,
+}
+
+impl Class {
+    /// The classes `--allow` names: every one but [`Class::Leave`].
+    pub const ALL: [Class; 6] = [Class::Send, Class::Delete, Class::Accounts, Class::Mailbox, Class::Settings, Class::Input];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::Send => "send",
+            Class::Delete => "delete",
+            Class::Leave => "leave",
+            Class::Accounts => "accounts",
+            Class::Mailbox => "mailbox",
+            Class::Settings => "settings",
+            Class::Input => "input",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Class> {
+        Class::ALL.into_iter().find(|c| c.as_str().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// What the class is, for a refusal or the docs.
+    pub fn what(self) -> &'static str {
+        match self {
+            Class::Send => "it writes to other people or reaches out to the web",
+            Class::Delete => "it deletes for good",
+            Class::Leave => "it takes the window off the message the owner is writing",
+            Class::Accounts => "it changes an account or a sign-in",
+            Class::Mailbox => "it opens, replaces or saves the mailbox file",
+            Class::Settings => "it changes options, signatures or rules",
+            Class::Input => "it clicks or types in the window",
+        }
+    }
+}
+
+/// A command's class for agents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Reading, searching, flagging, filing, local edits, ordinary synchronisation.
+    Safe,
+    /// Only with the owner's yes (bridged: a question in the window; headless: `--allow`).
+    Owner(Class),
+    /// Only with the owner's yes in the window, every time, whatever `--allow` says (#494): what
+    /// the owner is writing or changing and hasn't saved. Headless never: only the window's owner
+    /// writes or changes anything.
+    Asked(Class),
+    /// Not for agents at all (the host's own protocol, file pickers, the clipboard).
+    Never,
+}
+
+impl Access {
+    /// `"safe"`, `"owner"` or `"never"` (`engine.commands` lists it as `agent`, with `needs`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Access::Safe => "safe",
+            Access::Owner(_) | Access::Asked(_) => "owner",
+            Access::Never => "never",
+        }
+    }
+}
+
+const SAFE: &[&str] = &[
+    // A result the servers found for the owner's search, opened (and so fetched) as any message.
+    "search.openServerResult",
+    // File: content goes in and out as `data`; a path is refused separately.
+    "file.import",
+    "file.importFolderTree",
+    "file.importPst",
+    "file.exportMessage",
+    "file.exportFolder",
+    "file.exportCalendar",
+    "file.exportContacts",
+    "file.info",
+    // Reads what is known of the automatic replies (and has the window read them again).
+    "account.automaticReplies",
+    "edit.undo",
+    "edit.redo",
+    // Mail.
+    "mail.select",
+    "mail.selectAll",
+    "mail.next",
+    "mail.previous",
+    "mail.first",
+    "mail.last",
+    "mail.pageDown",
+    "mail.pageUp",
+    "mail.expandConversation",
+    "mail.collapseConversation",
+    "mail.get",
+    "mail.list",
+    "mail.delete",
+    "mail.archive",
+    "mail.move",
+    // Snoozing is filing, like a move (#949): into the Snoozed folder, and back by itself.
+    "mail.snooze",
+    "mail.unsnooze",
+    "mail.returnDue",
+    // Moving between Gmail's categories is a move, and asks what a move asks (#911): the messages
+    // named (`NEEDS_IDS`).
+    "mail.setGmailCategory",
+    "mail.copy",
+    "mail.markRead",
+    "mail.markUnread",
+    "mail.toggleRead",
+    "mail.markAllRead",
+    "mail.flag",
+    // Follow-up reminders (#948): an agent may set and clear them, and read what is due (message
+    // text, data); it never dismisses or snoozes one for the owner (see NEVER).
+    "mail.reminder",
+    "mail.clearReminder",
+    "mail.settleReminders",
+    "mail.dueReminders",
+    "compose.followUp",
+    // How a message can be unsubscribed from ("send": true is asked about, `classify`).
+    "mail.unsubscribe",
+    "mail.unsubscribeMany",
+    "mail.clearFlag",
+    "mail.complete",
+    "mail.toggleFlag",
+    "mail.categorize",
+    "mail.clearCategories",
+    "mail.pin",
+    "mail.junk",
+    "mail.notJunk",
+    "mail.findRelated",
+    "mail.findFromSender",
+    "mail.saveAttachment",
+    "mail.saveAllAttachments",
+    // The message's source as plain text: message text is data, never instructions.
+    "mail.viewSource",
+    // What a new appointment, task or contact made of a message starts with (#873): it makes
+    // nothing; message text is data, never instructions.
+    "mail.itemFromMessage",
+    // Downloads a signed or encrypted message's own bytes again from its own server (#30).
+    "mail.checkAgain",
+    // What checking a message's Digital signature found, read only (#30 R23).
+    "mail.digitalSignature",
+    // The Public keys kept, listed (never their bytes, never a key marked Verified): #30.
+    "keys.list",
+    "mail.new",
+    "mail.reply",
+    "mail.replyAll",
+    "mail.replyAndDelete",
+    "mail.forward",
+    "mail.forwardAsAttachment",
+    "mail.editDraft",
+    // A sent message opened again to send (nothing goes until Send, which is asked about).
+    "mail.resend",
+    // Writing (sending is not).
+    "compose.set",
+    "compose.replyTo",
+    "compose.readReceipt",
+    // Delay Delivery: a time on the message being written; nothing goes until Send, which is asked about (#950).
+    "compose.delay",
+    // A message waiting in the Outbox goes back to Drafts and is not sent (#950).
+    "mail.cancelSend",
+    // The message Send put in the Outbox for its wait is taken back and opened to write again (#950).
+    "compose.undoSend",
+    "compose.attach",
+    "compose.attachItem",
+    "insert.businessCard",
+    "insert.picture",
+    "compose.picture.set",
+    "compose.removeAttachment",
+    "compose.signature",
+    "compose.signatureAsText",
+    "compose.checkNames",
+    "compose.suggest",
+    "compose.highImportance",
+    "compose.lowImportance",
+    "compose.saveDraft",
+    "compose.close",
+    // Moves a message being written into a window of its own (#286): nothing of it changes.
+    "compose.popOut",
+    "compose.select",
+    "compose.type",
+    "compose.replaceText",
+    "compose.delete",
+    "compose.undo",
+    "compose.redo",
+    "compose.link",
+    "compose.formatHtml",
+    "compose.formatPlain",
+    "format.bold",
+    "format.italic",
+    "format.underline",
+    "format.size",
+    "format.color",
+    "format.font",
+    "format.bullets",
+    "format.numbering",
+    "format.clear",
+    "format.indent",
+    "format.outdent",
+    "format.align",
+    "edit.copy",
+    "edit.cut",
+    "edit.paste",
+    "edit.find",
+    "edit.replace",
+    "edit.formatPainter",
+    "format.highlight",
+    "insert.symbol",
+    "insert.dateTime",
+    "review.wordCount",
+    // Folders.
+    "folder.select",
+    "folder.list",
+    "folder.properties",
+    "folder.new",
+    "folder.rename",
+    "folder.move",
+    "folder.favorite",
+    // An account's place in the folder pane (#702): as moving a folder, nothing leaves this
+    // computer, nothing is removed, no setting of the account changes (the default account
+    // stays the one it was), and Undo puts it back.
+    "account.move",
+    // A folder's or a favourite's place in the folder pane (#1514): the same, kept on this
+    // computer alone.
+    "folder.reorder",
+    "folder.reorderFavorite",
+    // Takes up again messages left out for failing to download (#1581): the next Send/Receive asks for them.
+    "sync.retryFailed",
+    // View.
+    "view.favorites",
+    "view.reminders",
+    "view.mail",
+    "view.calendar",
+    "view.people",
+    "view.tasks",
+    "view.readingPane",
+    "view.gmailCategories",
+    "view.folderPane",
+    "view.navigationBar",
+    "view.conversations",
+    "view.sort",
+    "view.reverseSort",
+    "view.filter",
+    "view.search",
+    "view.clearSearch",
+    "view.searchSuggestions",
+    "view.previewLines",
+    "view.groups",
+    "view.oneLine",
+    "view.day",
+    "view.workWeek",
+    "view.week",
+    "view.month",
+    "view.today",
+    "view.next",
+    "view.previous",
+    "view.goToDate",
+    "view.taskFilter",
+    "view.taskAccount",
+    "view.peopleAccount",
+    // (People shows the address list; nothing is looked up for an agent: only what the owner types
+    // in the window's search box is, #1262.)
+    "people.addressBook",
+    "view.reset",
+    "view.inspect",
+    "view.days",
+    "view.next7Days",
+    "view.timeScale",
+    "view.weekNumbers",
+    "view.overlay",
+    "view.sideBySide",
+    "view.frontCalendar",
+    "view.workHours",
+    "view.timeZone",
+    "view.changeView",
+    "view.density",
+    "view.shadeRows",
+    "view.zoom",
+    "view.zoomIn",
+    "view.zoomOut",
+    "view.zoomReset",
+    // The owner's searches, kept on this computer: an agent reads mail anyway.
+    "view.recentSearches",
+    // Calendar ("send": true is asked about, `classify`).
+    "calendar.freeBusy",
+    "calendar.new",
+    "calendar.newMeeting",
+    "calendar.edit",
+    "calendar.move",
+    "calendar.select",
+    "calendar.get",
+    "calendar.list",
+    "calendar.respond",
+    "calendar.showAs",
+    "calendar.reminder",
+    "calendar.private",
+    "calendar.categorize",
+    "calendar.fromMessage",
+    "calendar.addCalendar",
+    "calendar.showCalendar",
+    "calendar.setCurrent",
+    "calendar.invitation",
+    "calendar.removeCancelled",
+    "calendar.showInvitation",
+    "calendar.importance",
+    "calendar.responseOptions",
+    "calendar.teamsMeeting",
+    "calendar.proposals",
+    "calendar.join",
+    "calendar.copy",
+    // A paste is a copy unless its params cut items or put them onto another account's server.
+    "calendar.selectAll",
+    "calendar.paste",
+    "calendar.calendars",
+    // Makes the subscribed calendars due a look ahead of their time: they were chosen by the owner.
+    "calendar.refreshSubscribed",
+    "calendar.showOnly",
+    "calendar.color",
+    "calendar.timeZones",
+    // A message opened for the owner to send, a summary put in one, what is known of answers.
+    "calendar.email",
+    "insert.calendar",
+    "calendar.contactAttendees",
+    "calendar.respondEmail",
+    "calendar.tracking",
+    "calendar.search",
+    // People and tasks.
+    "people.new",
+    "people.edit",
+    "people.select",
+    "people.get",
+    "people.list",
+    "people.search",
+    "people.arrange",
+    "people.favorite",
+    "people.categorize",
+    "people.email",
+    "people.fromMessage",
+    "people.findDuplicates",
+    // A meeting as calendar.newMeeting ("send": true is asked about, `classify`); a message
+    // opened for the owner to send.
+    "people.meeting",
+    "people.forward",
+    "tasks.statusReport",
+    "tasks.new",
+    "tasks.edit",
+    "tasks.complete",
+    "tasks.select",
+    "tasks.get",
+    "tasks.list",
+    "notes.list",
+    "notes.get",
+    "journal.list",
+    "journal.get",
+    "tasks.arrange",
+    "tasks.categorize",
+    "tasks.fromMessage",
+    "category.set",
+    // (Asked when it renames a category in Outlook: `classify`, #661.)
+    "category.rename",
+    "category.list",
+    "account.list",
+    "account.senderAddresses",
+    "account.offlineSize",
+    "account.preset",
+    // What Send/Receive is doing, or did: read only.
+    "sync.progress",
+    // Calls off the run under way; nothing is sent or lost by it.
+    "sync.cancel",
+    // Help: the addresses of the project's own pages, and what this copy is.
+    "help.help",
+    "help.training",
+    "help.support",
+    "help.feedback",
+    "help.whatsNew",
+    "file.account",
+    // The window's own.
+    "ui.tab",
+    "ui.showAttachmentMessage",
+    "ui.backstage",
+    "ui.collapseRibbon",
+    "ui.ribbonMode",
+    "ui.dialog",
+    "ui.closeDialog",
+    "ui.theme",
+    "ui.highContrast",
+    "ui.animations",
+    "ui.accent",
+    "ui.darkStyle",
+    "ui.lightMessages",
+    "ui.language",
+    "ui.interfaceSize",
+    "ui.focusSearch",
+    "ui.advancedSearch",
+    "ui.sync",
+    "ui.cancelSignIn",
+    "ui.cancelSync",
+    // Stops reading a mailbox in the background; the one open stays (#519).
+    "ui.cancelOpen",
+    "ui.skipSync",
+    "ui.favorites",
+    "ui.copyAdminConsentLink",
+    "ui.approvalHelp",
+    "ui.copyAdminMessage",
+    "ui.dismissReminder",
+    "ui.snoozeReminders",
+    "ui.toggleFolder",
+    "ui.openWindow",
+    "ui.eventWindow",
+    "ui.clearPictureCache",
+    "ui.selectAllInMessage",
+    // (Refused by the window itself unless the owner has the daily check on.)
+    "ui.checkForUpdates",
+    "ui.toggleCalendarGroup",
+    "ui.findInvitation",
+    // Opens a form in the owner's window, filled in from a message; nothing is made until saved.
+    "ui.dropOnModule",
+];
+
+const SEND: &[&str] = &[
+    "compose.send",
+    // Send, not before a time; and a new time for mail waiting in the Outbox, which may be sooner (#950).
+    "compose.sendLater",
+    "mail.setSendTime",
+    // The server answers mail on the owner's behalf with what it says.
+    "account.setAutomaticReplies",
+    "mail.sendAgain",
+    // A reaction (#1544) is a mail to the sender: one emoji, sent without a message to write.
+    "mail.react",
+    "calendar.propose",
+    "calendar.forward",
+    // A category the owner keeps on this computer alone, sent to Outlook (#661). It names the one
+    // category it sends, so it is asked about (`tasks.sendLocal`, the owner's answer for all the
+    // tasks kept here, is never an agent's).
+    "category.addToOutlook",
+    "ui.downloadPictures",
+    // Unsubscribes from a list: one click reaches its server, by mail writes to it.
+    "ui.unsubscribe",
+    "ui.unsubscribeMany",
+    "ui.retryPictures",
+    "ui.joinMeeting",
+    "ui.reportProblem",
+];
+
+const DELETE: &[&str] = &[
+    "mail.deletePermanently",
+    "mail.removeAttachment",
+    "folder.delete",
+    "folder.empty",
+    // Copies only this computer has, of mail its server has (#1401): undo brings them back, but
+    // they are gone from the mailbox. A preview only counts.
+    "mail.removeImportedDuplicates",
+    "calendar.removeCalendar",
+    // Local contacts, tasks, events and categories have no Deleted Items to come back from, and
+    // undo is short-lived (what a server has been told of events and tasks clears it).
+    "calendar.delete",
+    "people.delete",
+    // A merge removes the contacts merged into the kept one.
+    "people.merge",
+    "tasks.delete",
+    "category.remove",
+    "compose.discard",
+    "ui.closeWindow",
+];
+
+const ACCOUNTS: &[&str] = &[
+    "account.add",
+    "account.edit",
+    "account.remove",
+    // An Exchange server account stops trusting the certificate its owner chose to trust (#252).
+    "account.forgetEwsCertificate",
+    // Who the owner's mail can say it is from (#797).
+    "account.setSenderAddresses",
+    // Calendar and contacts servers (#209): choosing where an account's calendars and contacts
+    // are, and so where its password may be sent, is the owner's. (The question about a host
+    // outside the owner's domain and trusting a certificate join them when their commands exist.)
+    "account.davSet",
+    "account.davOff",
+    "account.graphSwitch",
+    "account.addSharedMailbox",
+    "account.removeSharedMailbox",
+    // Another person's calendar, opened by address (#70): it reaches that person's mailbox with
+    // the owner's sign-in, and removing one removes what is kept of it here.
+    "calendar.openShared",
+    "calendar.removeShared",
+    // Calendars on the web (#209): subscribing makes this computer fetch an address (which may
+    // hold a secret) from then on; an agent never chooses one unasked.
+    "calendar.subscribe",
+    "calendar.unsubscribe",
+    "calendar.subscriptionSettings",
+    // A shared mailbox's calendar listed twice (#70): hiding the copy removes it and its events
+    // from this computer.
+    "calendar.hideListedCopy",
+    // Mail to keep offline (#143): what is kept on this computer; the server keeps it all.
+    "account.thinOffline",
+    "ui.keepOffline",
+    // Device limits (MB3.16): what a phone keeps; the server keeps it all.
+    "account.deviceLimits",
+    "account.trimDevice",
+    "calendar.moveToAccount",
+    "ui.connectMicrosoft",
+    "ui.automaticRepliesSignIn",
+    "ui.connectFavorites",
+    "ui.allowSharedSend",
+    "ui.allowSharedCalendars",
+    "ui.allowSync",
+    "ui.allowTasks",
+    "ui.allowRules",
+    "ui.allowAutomaticReplies",
+    "ui.checkCalendar",
+    "ui.adminConsent",
+    "ui.signInAgain",
+    "ui.microsoftClientId",
+    "ui.rememberSignIn",
+    "ui.graphSwitch",
+    "ui.switchToGraph",
+    // The owner's yes to the servers of a mailbox opened from a file.
+    "ui.confirmServers",
+];
+
+const MAILBOX: &[&str] = &["file.new", "file.open", "file.save", "file.saveAs"];
+
+const SETTINGS: &[&str] = &[
+    // Hides the sender-warning banner of a message (#508): an agent must not be able to quiet
+    // the owner's phishing warning.
+    "mail.dismissWarnings",
+    "file.options",
+    // Work Offline: turned off, what waits in the Outbox goes out.
+    "sync.offline",
+    // Wait before sending (Undo Send): turned off, what is sent goes at the next run (#950).
+    "sync.waitBeforeSending",
+    "calendar.deleteAnsweredRequests",
+    "rules.add",
+    "rules.remove",
+    "rules.enable",
+    "rules.list",
+    "rules.run",
+    "rules.fromMessage",
+    "rules.move",
+    "rules.keepOnServer",
+    // Junk E-mail Options (#504): what the lists send to Junk E-mail or let through.
+    "junk.blockSender",
+    "junk.neverBlockSender",
+    "junk.neverBlockDomain",
+    "junk.add",
+    "junk.remove",
+    "junk.list",
+    // The Public keys that Digital signatures are checked with, and later mail encrypted to (#30).
+    "keys.import",
+    "keys.remove",
+    "signature.set",
+    "signature.remove",
+    "signature.rename",
+    "signature.defaults",
+    "signature.picture.add",
+    "signature.picture.set",
+    "signature.picture.remove",
+    "signature.layout",
+    "signature.details",
+    "signature.html",
+    "signature.open",
+    "signature.save",
+    "signature.close",
+    "ui.alwaysDownloadPictures",
+    "ui.downloadPicturesAutomatically",
+    "ui.senderImages",
+    "ui.desktopAlerts",
+    "ui.closeToTray",
+    "ui.repliesInWindow",
+    "ui.attachmentPictures",
+    "ui.swipeAction",
+    "ui.updateCheck",
+    "ui.updateInstall",
+    "ui.dismissUpdateNotice",
+    "ui.dismissSettingsNotice",
+    "ui.dismissSoftwareNotice",
+];
+
+const NEVER: &[&str] = &[
+    // The owner's Dismiss and Snooze of a follow-up reminder (#948): an agent never does either
+    // for the owner.
+    "mail.dismissReminder",
+    "mail.postponeReminder",
+    // The host's side of a synchronisation: what came from a server is the host's to say.
+    "sync.request",
+    "sync.apply",
+    "sync.graphRequest",
+    "sync.applyGraph",
+    "sync.graphFetchRequest",
+    "sync.applyGraphFetch",
+    "sync.jmapRequest",
+    "sync.applyJmap",
+    "sync.jmapFetchRequest",
+    "sync.applyJmapFetch",
+    "sync.ewsRequest",
+    "sync.applyEws",
+    "sync.ewsFetchRequest",
+    "sync.applyEwsFetch",
+    // Calendars and contacts on a server (#209), likewise.
+    "sync.davRequest",
+    "sync.applyDav",
+    "sync.davChanges",
+    "sync.applyDavUploaded",
+    // A search of the server goes only on the owner's own click (R6.2).
+    "sync.graphSearchRequest",
+    "sync.applyGraphSearch",
+    "ui.moreResultsOnServer",
+    "sync.holdSends",
+    "sync.eventChanges",
+    "sync.applyEventChanges",
+    "sync.applyEvents",
+    "sync.applyContacts",
+    "sync.taskChanges",
+    "sync.applyTaskChanges",
+    "sync.applyTasks",
+    "sync.ruleChanges",
+    "sync.applyRuleChanges",
+    "sync.applyRules",
+    "sync.applyCalendars",
+    "sync.applyCategories",
+    // What a Microsoft account's server is told of its categories, and whether its list may be
+    // changed (#661): the host's to say, never an agent's.
+    "sync.categoryChanges",
+    "sync.applyCategoryChanges",
+    "sync.categoryWrites",
+    "sync.applyFavorites",
+    "sync.applyMailboxSettings",
+    "sync.applyAutomaticReplies",
+    // Subscribed calendars (#209): the addresses a host is to look at, and what it brought.
+    "sync.subscriptionRequest",
+    "sync.applySubscription",
+    "sync.forgetRemote",
+    // File pickers are the owner's; agents pass `data`.
+    "ui.open",
+    "ui.import",
+    "ui.attach",
+    // A message file the owner opened, kept or written out: the owner's own doing (#515).
+    "ui.moveWindowMessage",
+    "ui.saveWindowMessage",
+    // Anything an agent chooses onto the owner's clipboard.
+    "ui.copyLinkAddress",
+    "ui.copySelection",
+    // The Calendar's Copy is the owner's own: it puts the set they selected on the window's own
+    // clipboard, which is theirs, and an agent's place is never taken there — asked or granted.
+    "ui.calendarCopy",
+    // Cut also writes the owner's clipboard; no agent grant permits it.
+    "ui.calendarCut",
+    // Paste puts that clipboard where the owner picked, moving what was cut: the window's
+    // clipboard is the owner's, so no agent grant reaches it either.
+    "ui.calendarPaste",
+    // A file from a message opened with another program: only ever the owner's own doing.
+    "mail.openAttachment",
+    "ui.previewAttachment",
+    // Installing a new version, or going back to the one before: only the owner's click.
+    "ui.restartToUpdate",
+    "ui.goBackVersion",
+    // The owner's own answer to sending the tasks that exist only here to an account's To Do
+    // (#632): an agent never gives it, asked or not.
+    "tasks.sendLocal",
+    // Everything MailCraft keeps on this computer, gone (#177): only the owner's own click.
+    "ui.removeAllData",
+    // Another program (the file manager) started on the owner's screen, as for an attachment
+    // (#460): only ever the owner's own click.
+    "ui.openDataFolder",
+    // The redacted log tail, and the clipboard overwritten with it.
+    "ui.copyDiagnostics",
+    // Only the owner may configure an OAuth registration; an agent has no route to its
+    // installed-app registration value, even when granted account/settings commands.
+    "ui.googleClientId",
+    "ui.googleClientSecret",
+    // The owner's own keys (#30 R12, R13): imported, removed and looked for in the window only,
+    // through a file picker and a passphrase typed there; and a key marked Verified only by the
+    // owner, in the dialog that shows its fingerprint (R6, R23).
+    "ui.importPrivateKey",
+    "ui.removePrivateKey",
+    "ui.refreshOwnKeys",
+    "ui.importPublicKey",
+    "ui.verifyKey",
+    "ui.markKeyVerified",
+];
+
+/// A command's class by id; `None`: not classified (and so refused).
+pub fn access(id: &str) -> Option<Access> {
+    let is = |list: &[&str]| list.contains(&id);
+    Some(if is(SAFE) {
+        Access::Safe
+    } else if is(SEND) {
+        Access::Owner(Class::Send)
+    } else if is(DELETE) {
+        Access::Owner(Class::Delete)
+    } else if is(ACCOUNTS) {
+        Access::Owner(Class::Accounts)
+    } else if is(MAILBOX) {
+        Access::Owner(Class::Mailbox)
+    } else if is(SETTINGS) {
+        Access::Owner(Class::Settings)
+    } else if is(NEVER) {
+        Access::Never
+    } else {
+        return None;
+    })
+}
+
+/// Every id an agent may run (with the owner's yes or without): the engine's and the window's.
+pub fn runnable() -> impl Iterator<Item = &'static str> {
+    [SAFE, SEND, DELETE, ACCOUNTS, MAILBOX, SETTINGS].into_iter().flatten().copied()
+}
+
+/// How a command uses a param that names a file on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileUse {
+    /// Read; the command takes the bytes as `data` instead, with the file's name in `name_key`.
+    Reads { name_key: &'static str },
+    /// Written; without the param the command answers the bytes as `data`. `ext`: the extension
+    /// the file must have ("" for any but programs and scripts).
+    Writes { ext: &'static str },
+    /// The mailbox file itself (and its content folder): never named by an agent.
+    Refused,
+    /// A folder that files are written into; without the param the command answers each file
+    /// as `data`, which is what an agent gets.
+    Folder,
+}
+
+/// The params that name files, by command. (`folder.select`'s `path` is a folder of the
+/// mailbox, not a file.) The window's `ui.screenshot {path}` is the control channel's.
+pub const FILE_PARAMS: &[(&str, &str, FileUse)] = &[
+    ("file.open", "path", FileUse::Reads { name_key: "name" }),
+    ("file.import", "path", FileUse::Reads { name_key: "name" }),
+    ("file.importFolderTree", "path", FileUse::Reads { name_key: "name" }),
+    ("file.importPst", "path", FileUse::Reads { name_key: "name" }),
+    ("compose.attach", "path", FileUse::Reads { name_key: "name" }),
+    ("insert.picture", "path", FileUse::Reads { name_key: "file" }),
+    ("signature.picture.add", "path", FileUse::Reads { name_key: "file" }),
+    ("keys.import", "path", FileUse::Reads { name_key: "name" }),
+    ("file.save", "path", FileUse::Refused),
+    ("file.saveAs", "path", FileUse::Refused),
+    ("file.exportMessage", "path", FileUse::Writes { ext: "eml" }),
+    ("file.exportFolder", "path", FileUse::Writes { ext: "mbox" }),
+    ("file.exportCalendar", "path", FileUse::Writes { ext: "ics" }),
+    ("file.exportContacts", "path", FileUse::Writes { ext: "vcf" }),
+    ("mail.saveAttachment", "path", FileUse::Writes { ext: "" }),
+    ("mail.saveAllAttachments", "path", FileUse::Folder),
+    ("ui.reportProblem", "path", FileUse::Writes { ext: "txt" }),
+];
+
+/// The file param of `id`, if it has one.
+pub fn file_param(id: &str) -> Option<(&'static str, FileUse)> {
+    FILE_PARAMS.iter().find(|(c, ..)| *c == id).map(|(_, k, u)| (*k, *u))
+}
+
+/// The file param `params` gives `id`, if any (a `null` doesn't count).
+pub fn file_named(id: &str, params: &Value) -> Option<&'static str> {
+    file_param(id).map(|(k, _)| k).filter(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// The refusal for a file param from an agent.
+pub fn no_paths(id: &str, key: &str) -> String {
+    format!(
+        "`{id}` was given `{key}`: agents don't name files on this computer. Pass the content as base64 `data` (and leave out `{key}` to get it back as `data`), or ask the owner to start the server with `mailcraft-cli mcp --files DIR`"
+    )
+}
+
+/// `id` with these params: its class, now (`"send": true`, the Outbox, Deleted Items).
+pub fn classify(s: &Session, id: &str, params: &Value) -> Access {
+    let Some(base) = access(id) else { return Access::Never };
+    if id == "calendar.paste" {
+        return paste_access(s, params);
+    }
+    let sends = p::bool(params, "send") == Some(true);
+    // An appointment's window with changes the owner hasn't saved closes with the appointment
+    // (`unsaved`, from `agent_gate`): taking that away is asked about every time (#494).
+    if matches!(id, "calendar.delete" | "calendar.removeCalendar" | "edit.undo" | "edit.redo") && unsaved(params) {
+        return Access::Asked(match id {
+            "edit.undo" | "edit.redo" => s.undo_reverts(id == "edit.redo").unwrap_or(Class::Delete),
+            _ if sends => Class::Send,
+            _ => Class::Delete,
+        });
+    }
+    // A cancellation sent to the people invited is the stronger question.
+    if id == "calendar.delete" && sends {
+        return Access::Owner(Class::Send);
+    }
+    // The people a To Do list is shared with see what is done to its to-dos (#461); deleting
+    // one asks this too, the stronger question.
+    if shared_task(s, id, params).is_some() || shared_category(s, id, params) {
+        return Access::Owner(Class::Send);
+    }
+    // A to-do put in another account's To Do than the owner's own would go to is on that server
+    // at once, as mail moved there is (#632).
+    if new_task_onto(s, id, params).is_some() {
+        return Access::Owner(Class::Send);
+    }
+    // A rule that files mail into another account's folder puts it on that server, as a move
+    // there does (#451).
+    if rules_onto_another_server(s, id, params) {
+        return Access::Owner(Class::Send);
+    }
+    if server_rule_deletes(s, id, params) {
+        return Access::Owner(Class::Delete);
+    }
+    // A rename on a list kept in step with Outlook makes the new name there and deletes the old
+    // one (#661): the owner says yes first, as for sending what is kept on this computer alone.
+    if id == "category.rename" && renames_in_outlook(s, params) {
+        return Access::Owner(Class::Send);
+    }
+    // So does a category made in Outlook, or given another colour there, as Add to Outlook asks
+    // (#661): the next job writes it there.
+    if makes_in_outlook(s, id, params).is_some() {
+        return Access::Owner(Class::Send);
+    }
+    // A rule its server has is deleted there, where undo doesn't reach and MailCraft may not be
+    // able to make it again (#566), as `tasks.delete`; so is one that went to be made there and
+    // had no answer, which the server may have.
+    let there = |x: &mailcraft_model::Rule| x.on_server() || x.unanswered;
+    if id == "rules.remove" && p::id(params, "id").is_some_and(|r| s.mailbox.rules.iter().any(|x| x.id == r && there(x))) {
+        return Access::Owner(Class::Delete);
+    }
+    // What the owner is writing or changing is theirs to let go of, whatever `--allow` says
+    // (#494): Discard throws the message away with its draft; a window closed with changes in its
+    // appointment that aren't saved (`unsaved`, from `agent_gate`) loses them; another mailbox in
+    // view closes the message without saving it, and the windows of its appointments.
+    let writing = owner_writing(s, params);
+    // A draft opened in a window opens where messages are written, as `mail.editDraft`.
+    if let Some(draft) = draft_in_window(s, id, params) {
+        return classify(s, "mail.editDraft", &json!({"id": draft}));
+    }
+    match id {
+        "compose.discard" if writing => return Access::Asked(Class::Delete),
+        "ui.closeWindow" if unsaved(params) => return Access::Asked(Class::Delete),
+        "file.new" | "file.open" if owner_writing_any(s) || unsaved(params) => return Access::Asked(Class::Mailbox),
+        "mail.removeImportedDuplicates" if p::bool(params, "preview") == Some(true) => return Access::Safe,
+        _ => {}
+    }
+    if base != Access::Safe {
+        return base;
+    }
+    match id {
+        // Undoing can put back the accounts, rules or signatures of before.
+        "edit.undo" | "edit.redo" => s.undo_reverts(id == "edit.redo").map_or(Access::Safe, Access::Owner),
+        // Saving or sending the appointment in a window runs later, as the owner, and the
+        // account's server writes to the people invited: that is a send.
+        "ui.eventWindow" if matches!(p::str(params, "do"), Some("send" | "save" | "saveAndClose")) => Access::Owner(Class::Send),
+        _ if (id.starts_with("calendar.") || id == "people.meeting") && sends => Access::Owner(Class::Send),
+        "mail.move" | "mail.copy" | "file.import" => {
+            let folder = p::id(params, "folder").or(if id == "file.import" { Some(s.view.folder) } else { None });
+            let onto = id != "file.import" && folder.is_some_and(|f| onto_another_server(s, params, f));
+            if folder.is_some_and(|f| is_outbox(&s.mailbox, f)) || onto { Access::Owner(Class::Send) } else { Access::Safe }
+        }
+        "mail.delete" => {
+            let ids = taken(params);
+            if ids.iter().any(|m| deletes_for_good(&s.mailbox, *m)) { Access::Owner(Class::Delete) } else { Access::Safe }
+        }
+        "ui.sync" if params.get("password").is_some_and(|v| !v.is_null()) => Access::Owner(Class::Accounts),
+        "mail.unsubscribe" if sends => Access::Owner(Class::Send),
+        // A command that closes the message being written, or puts another in its place, saves
+        // what isn't saved of it first (#442). Letting that go instead (`discard`) is throwing it
+        // away. When the owner wrote in it, the window asks them every time either way, saved or
+        // not, until it is closed (#494); an agent's own message, headless too, is the agent's to
+        // leave.
+        _ if leaves(id) && s.compose_named(params).is_some_and(|c| unsaved_message(s, c) || c.owner_changed) => {
+            let lost = s.compose_named(params).is_some_and(|c| unsaved_message(s, c)) && p::bool(params, "discard") == Some(true);
+            match (writing, lost) {
+                (true, true) => Access::Asked(Class::Delete),
+                (true, false) => Access::Asked(Class::Leave),
+                (false, true) => Access::Owner(Class::Delete),
+                (false, false) => Access::Safe,
+            }
+        }
+        // An appointment, a contact or a task with changes that aren't saved, in the dialog that
+        // this closes or opens another in place of: the changes are lost. The window says which
+        // (`unsaved`, from `agent_gate`, never from the agent).
+        // The page that reviews an Exchange server's certificate looks at the server over the network.
+        "ui.dialog" if p::str(params, "page") == Some("certificate") => Access::Owner(Class::Accounts),
+        "ui.closeDialog" | "ui.dialog" if params.get("unsaved").is_some_and(|v| !v.is_null()) => Access::Asked(Class::Delete),
+        _ => Access::Safe,
+    }
+}
+
+/// Whether `id` closes the message being written: [`LEAVING`]. Those that start another open it
+/// beside it (#286).
+fn leaves(id: &str) -> bool {
+    LEAVING.contains(&id)
+}
+
+/// Whether what is written in the message isn't all in Drafts to stay: changed since it was
+/// saved, its draft is gone (#494), or it is there only by the background saves, which `discard`
+/// takes out again (#286).
+fn unsaved_message(s: &Session, c: &crate::Compose) -> bool {
+    c.dirty || c.autosaved || draft_gone(s, c)
+}
+
+/// Whether the owner wrote in the message being written that a call acts on (`compose`, else the
+/// current one, #494): it is theirs until it is closed.
+fn owner_writing(s: &Session, params: &Value) -> bool {
+    s.compose_named(params).is_some_and(|c| c.owner_changed)
+}
+
+/// Whether the owner wrote in any message being written (#286): another mailbox closes them all.
+fn owner_writing_any(s: &Session) -> bool {
+    s.all_composing().any(|c| c.owner_changed)
+}
+
+/// The draft that `ui.openWindow` would open, which it opens as `mail.editDraft` does.
+fn draft_in_window(s: &Session, id: &str, params: &Value) -> Option<Id> {
+    if id != "ui.openWindow" {
+        return None;
+    }
+    p::id(params, "message").filter(|m| s.mailbox.message(*m).is_some_and(|m| m.draft))
+}
+
+/// Whether the window says the command would lose changes the owner hasn't saved in a form
+/// (`unsaved`, from `agent_gate`, never from the agent).
+fn unsaved(params: &Value) -> bool {
+    params.get("unsaved").is_some_and(|v| !v.is_null())
+}
+
+/// The account whose To Do a to-do made by `id` would go to, unless it is the account the owner
+/// sent their local to-dos to. That answer is the owner's alone, where an agent can move the list
+/// and with it the place a new to-do goes. A message named wrongly says nothing of where the to-do
+/// would go, so it counts as going elsewhere: 0, no account in particular.
+fn new_task_onto(s: &Session, id: &str, params: &Value) -> Option<Id> {
+    let Ok(place) = crate::cmd::tasks::place_of(s, id, params) else { return Some(0) };
+    let place = place.filter(|place| *place != 0)?;
+    (crate::cmd::tasks_remote::tasks_home(&s.mailbox) != Some(place)).then_some(place)
+}
+
+/// The to-do that `id` would change, when it is in a list shared with other people. The to-do is
+/// found as the command finds it (`id`, else the selected one); one that isn't there is left to
+/// the command, which changes nothing and says so.
+fn shared_task<'a>(s: &'a Session, id: &str, params: &Value) -> Option<&'a mailcraft_model::Task> {
+    if !matches!(id, "tasks.edit" | "tasks.complete" | "tasks.categorize" | "tasks.delete") {
+        return None;
+    }
+    p::id_strict(params, "id").ok().and_then(|t| t.or(s.sel.task)).and_then(|t| s.mailbox.task(t)).filter(|t| s.mailbox.in_shared_task_list(t))
+}
+
+/// Whether `category.rename` with these params would rename a category in Outlook (#661): one
+/// of a Microsoft account's list kept in step with its server, and not kept on this computer
+/// alone. (A name the list doesn't have is left to the command, which refuses it.)
+fn renames_in_outlook(s: &Session, params: &Value) -> bool {
+    let Ok(account) = crate::cmd::category::list_account(s, params) else { return false };
+    let Some(from) = p::str(params, "from") else { return false };
+    s.mailbox.category_of(account, from).is_some() && crate::cmd::category::in_outlook(s, account, from) == Some(true)
+}
+
+/// Whether `category.remove` with these params would delete a category in Outlook (#661): one
+/// of a list kept in step with Outlook that MailCraft may change there, and not kept on this
+/// computer alone.
+fn removes_in_outlook(s: &Session, params: &Value) -> bool {
+    let Ok(account) = crate::cmd::category::list_account(s, params) else { return false };
+    let Some(name) = p::str(params, "name") else { return false };
+    s.mailbox.categories_read_only(account).is_none()
+        && s.mailbox.category_of(account, name).is_some()
+        && crate::cmd::category::in_outlook(s, account, name) == Some(true)
+}
+
+/// What a call makes in Outlook of a list of categories kept in step with it (#661), which the
+/// next job writes there: `category.set` with a name the list doesn't have (`made`) or another
+/// colour for one that goes there; a Categorize call, a new or changed to-do or event, or a
+/// meeting with a contact, that puts on an item a name its list doesn't have; a rule made,
+/// switched on or run that gives mail such a name, or a change beside such a rule that lets more
+/// mail reach it or has it give another name ([`beside_makes_in_outlook`]). The names, and the
+/// accounts whose Outlook it is. Read as the command reads its params (through the same
+/// functions); what the command refuses (a list MailCraft may not change there, a colour Outlook
+/// hasn't got, ids named wrongly) makes nothing, and asks nothing. (A contact's new or changed
+/// categories are this computer's list, or are refused: a contact an account's server keeps isn't
+/// edited here.)
+struct MadeInOutlook {
+    names: Vec<String>,
+    owners: Vec<Id>,
+    made: bool,
+}
+
+/// What an undo or redo that is a change of settings puts back, in its question.
+const SETTINGS_PUT_BACK: &str = "the rules, signatures or Safe and Blocked Senders";
+
+/// What an undo or redo that writes to people puts back, in its question.
+const SENT_ITEMS: &str = "a change to a meeting or to a task in a shared list, which other people see, or to the tasks in an account's To Do";
+
+/// The commands that give an item the categories a `categories` list names (#661).
+const GIVES_CATEGORIES: [&str; 6] = ["tasks.new", "tasks.edit", "calendar.new", "calendar.newMeeting", "calendar.edit", "people.meeting"];
+
+/// The commands that make, switch on or run rules, which may give mail a category (#661).
+/// The calls that make, switch on or off, delete, move, keep elsewhere or run a rule: each changes
+/// which rules run on mail, and so what they give it.
+const RUNS_RULES: [&str; 7] = ["rules.add", "rules.fromMessage", "rules.enable", "rules.run", "rules.remove", "rules.move", "rules.keepOnServer"];
+
+/// The account a list kept in step with Outlook is, for the items of `account`, when MailCraft may
+/// change it there.
+fn writable_list(mb: &Mailbox, account: Id) -> Option<Id> {
+    mb.synced_list_owner(account).filter(|_| mb.categories_read_only(account).is_none())
+}
+
+fn makes_in_outlook(s: &Session, id: &str, params: &Value) -> Option<MadeInOutlook> {
+    use crate::cmd;
+    let mb = &s.mailbox;
+    let writable = |account: Id| writable_list(mb, account);
+    if GIVES_CATEGORIES.contains(&id) {
+        let (account, given, had, was) = match id {
+            "tasks.new" | "tasks.edit" => cmd::tasks::categories_given(s, id, params).map(|(a, given, had)| (a, given, had, a))?,
+            // A meeting with a contact is `calendar.newMeeting` with the contact among the attendees.
+            "people.meeting" => cmd::calendar::categories_given(s, "calendar.newMeeting", &cmd::people::meeting_params(s, params).ok()?)?,
+            _ => cmd::calendar::categories_given(s, id, params)?,
+        };
+        let owner = writable(account)?;
+        let names = cmd::category::joining(s, account, &given, &had, was);
+        return (!names.is_empty()).then_some(MadeInOutlook { names, owners: vec![owner], made: true });
+    }
+    if RUNS_RULES.contains(&id) {
+        return gathered(rules_make_in_outlook(s, id, params));
+    }
+    if changes_beside_rules(id) {
+        return gathered(beside_makes_in_outlook(s, id, params));
+    }
+    let (name, lists): (String, Vec<Id>) = match id {
+        "category.set" => {
+            let color = p::str(params, "color").and_then(mailcraft_model::Rgb::parse)?;
+            let account = cmd::category::list_account(s, params).ok()?;
+            let name = p::str(params, "name").and_then(mailcraft_model::clean_name)?;
+            let owner = writable(account)?;
+            mailcraft_model::outlook_colors::outlook_preset(color)?;
+            return match mb.category_of(account, &name) {
+                None => Some(MadeInOutlook { names: vec![name], owners: vec![owner], made: true }),
+                Some(c) if c.color != mailcraft_model::outlook_colors::nearest_outlook_color(color) && !mb.category_is_local(owner, &c.name) => {
+                    Some(MadeInOutlook { names: vec![c.name.clone()], owners: vec![owner], made: false })
+                }
+                Some(_) => None,
+            };
+        }
+        "mail.categorize" => match cmd::mail::categorizing(s, params).ok()? {
+            (name, accounts, true) => (name, accounts.into_iter().collect()),
+            _ => return None,
+        },
+        "tasks.categorize" => match cmd::tasks::categorizing(s, params).ok()? {
+            (_, name, account, true) => (name, vec![account]),
+            _ => return None,
+        },
+        "people.categorize" => match cmd::people::categorizing(s, params).ok()? {
+            (_, name, account, true) => (name, vec![account]),
+            _ => return None,
+        },
+        "calendar.categorize" => match cmd::calendar::categorizing(s, params).ok()? {
+            (_, name, account, true) => (name, vec![account]),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut owners: Vec<Id> = Vec::new();
+    for account in lists.into_iter().filter(|a| mb.category_of(*a, &name).is_none()) {
+        if let Some(owner) = writable(account).filter(|o| !owners.contains(o)) {
+            owners.push(owner);
+        }
+    }
+    (!owners.is_empty()).then_some(MadeInOutlook { names: vec![name], owners, made: true })
+}
+
+/// The names the rules give and the lists they are new on, each name and each list once; `None`
+/// for none.
+fn gathered(made: Vec<(String, Id)>) -> Option<MadeInOutlook> {
+    let mut names: Vec<String> = Vec::new();
+    let mut owners: Vec<Id> = Vec::new();
+    for (name, owner) in made {
+        if !names.iter().any(|n| mailcraft_model::sync::same_category(n, &name)) {
+            names.push(name);
+        }
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    (!names.is_empty()).then_some(MadeInOutlook { names, owners, made: true })
+}
+
+/// The categories the rules that run on mail in `mb` give it and put on a list kept in step with
+/// Outlook that hasn't got them (#661): what an undo or a redo that puts back the rules has them
+/// make there, counted as the rule calls count it ([`rules_make_in_outlook`]).
+pub(crate) fn rules_in_outlook(mb: &Mailbox) -> Vec<(String, Id)> {
+    let mut out = Vec::new();
+    for r in mb.rules.iter().filter(|r| runs_on_new_mail(r)) {
+        rule_makes_in_outlook(mb, r, one_account(r), Counted::Alone, &mut out);
+    }
+    out
+}
+
+/// [`rules_in_outlook`] of `back`, the mailbox an undo or redo from `now` puts back, as the step
+/// reaches the rules (#566, #661): all of them when it changes them or a list of categories (a
+/// rename, a deletion, a colour: what a rule then gives may be new on a list, or a rule may take
+/// other mail; counted whole, as the rules are, which may ask more than the call did); when it
+/// changes only what they read (the Safe or Blocked Senders letting more mail through, an
+/// account's address a rule reads: [`changed_accounts`]), the rules for that mail. What the step
+/// makes new comes first: a question names three, and that is why it is asked.
+pub(crate) fn undo_rules_in_outlook(now: &Mailbox, back: &Mailbox) -> Vec<(String, Id)> {
+    let before = rules_in_outlook(now);
+    let (new, rest): (Vec<_>, Vec<_>) = undo_reaches_in_outlook(now, back).into_iter().partition(|made| !had(&before, made));
+    new.into_iter().chain(rest).collect()
+}
+
+/// [`undo_rules_in_outlook`], in the rules' order.
+fn undo_reaches_in_outlook(now: &Mailbox, back: &Mailbox) -> Vec<(String, Id)> {
+    if back.rules != now.rules {
+        return rules_in_outlook(back);
+    }
+    let mut out = if lists_differ(now, back) { rules_in_outlook(back) } else { Vec::new() };
+    let changed = changed_accounts(now, back);
+    // An account given another address has its list kept on this computer alone until its new
+    // server's is read, and what a rule gives its mail is made there then: judged on the list as
+    // it is kept in step.
+    let lists = |a: Id| if back.synced_list_owner(a).is_none() && now.synced_list_owner(a).is_some() { now } else { back };
+    for r in back.rules.iter().filter(|r| runs_on_new_mail(r) && reached(&changed, r)) {
+        match one_account(r) {
+            Some(a) => rule_makes_in_outlook(lists(a), r, Some(a), Counted::Alone, &mut out),
+            // A rule for every account's mail: what it does with the mail of the accounts the step
+            // reaches.
+            None => {
+                for a in &changed {
+                    rule_makes_in_outlook(lists(*a), r, (*a != 0).then_some(*a), Counted::Alone, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `made` (a name and the list it is new on) is among `before`.
+fn had(before: &[(String, Id)], (name, owner): &(String, Id)) -> bool {
+    before.iter().any(|(n, o)| o == owner && mailcraft_model::sync::same_category(n, name))
+}
+
+/// Whether the lists of categories differ, or whether they are kept in step with Outlook.
+fn lists_differ(now: &Mailbox, to: &Mailbox) -> bool {
+    now.categories != to.categories
+        || now.account_categories != to.account_categories
+        || now.local_categories != to.local_categories
+        || now.server_categories != to.server_categories
+        || now.category_writes != to.category_writes
+}
+
+/// Whether an undo or redo from `now` to `to` that leaves the rules as they are changes what they
+/// read (the Safe or Blocked Senders, so that more mail gets through to them, or an account's
+/// address a rule reads: [`changed_accounts`]) or the lists of categories the names they give
+/// are looked up on.
+pub(crate) fn undo_changes_what_rules_read(now: &Mailbox, to: &Mailbox) -> bool {
+    to.rules == now.rules && (!changed_accounts(now, to).is_empty() || lists_differ(now, to))
+}
+
+/// Whether a rule runs here: when it is switched on, or, on new mail, when its server last had it
+/// on.
+fn runs_on_new_mail(r: &mailcraft_model::Rule) -> bool {
+    r.enabled || r.server.as_ref().is_some_and(|s| s.synced_enabled)
+}
+
+/// The categories the rules a call makes, switches on or off, deletes, moves, keeps elsewhere or
+/// runs give mail and put on a list kept in step with Outlook that hasn't got them, so that the
+/// next job makes them there (#661); each with that list's account. A rule for one account gives
+/// that account's mail its categories; one for every account, every account's. Read as the
+/// commands read their params, as for [`rules_onto_another_server`].
+fn rules_make_in_outlook(s: &Session, id: &str, params: &Value) -> Vec<(String, Id)> {
+    let mb = &s.mailbox;
+    let mut out = Vec::new();
+    let named = || p::id(params, "id").and_then(|r| mb.rules.iter().find(|x| x.id == r));
+    match id {
+        "rules.add" => {
+            if let Ok(r) = crate::cmd::rules::rule_from_params(s, params) {
+                rule_makes_in_outlook(mb, &r, one_account(&r), Counted::WithOthers, &mut out);
+            }
+        }
+        "rules.fromMessage" => {
+            if let Ok((r, _)) = crate::cmd::rules::rule_from_message(s, params) {
+                rule_makes_in_outlook(mb, &r, one_account(&r), Counted::WithOthers, &mut out);
+            }
+        }
+        "rules.enable" => {
+            if let (Ok(value), Some(r)) = (p::opt_bool(params, "value"), named()) {
+                let counted = if value.unwrap_or(!r.enabled) { Counted::WithOthers } else { Counted::Others };
+                rule_makes_in_outlook(mb, r, one_account(r), counted, &mut out);
+            }
+        }
+        "rules.remove" => {
+            if let Some(r) = named() {
+                rule_makes_in_outlook(mb, r, one_account(r), Counted::Others, &mut out);
+            }
+        }
+        "rules.move" | "rules.keepOnServer" => {
+            if let Some(r) = named() {
+                let counted = if r.enabled { Counted::WithOthers } else { Counted::Others };
+                rule_makes_in_outlook(mb, r, one_account(r), counted, &mut out);
+            }
+        }
+        "rules.run" => {
+            let (Ok(folder), Ok(only)) = (p::id_strict(params, "folder"), p::id_strict(params, "id")) else { return out };
+            if let Some(a) = mb.folder(folder.unwrap_or(s.view.folder)).map(|f| f.account) {
+                for r in mb.rules.iter().filter(|r| r.enabled && r.is_for(a) && only.is_none_or(|o| o == r.id)) {
+                    rule_makes_in_outlook(mb, r, Some(a), Counted::Alone, &mut out);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The changes beside the rules that may let more mail reach them, or have them give mail another
+/// name (#566): a change to the Safe or Blocked Senders, of an account's address, of the zone the
+/// calendar is shown in, or a category's rename.
+fn changes_beside_rules(id: &str) -> bool {
+    id.starts_with("junk.") || matches!(id, "account.edit" | "view.timeZone" | "category.rename")
+}
+
+/// The categories that the rules a change beside them reaches ([`changes_beside_rules`]) give
+/// mail and put on a list kept in step with Outlook that hasn't got them (#661), each with that
+/// list's account; read as [`rules_onto_another_server`] reads the change, so that what it asks a
+/// send for when such a rule puts mail onto another server it asks for when such a rule makes a
+/// category in Outlook. A change to the Safe or Blocked Senders that lets more mail through
+/// ([`junk_lets_through`]) reaches the rules for that mail; a change of an account's address, or
+/// of the zone, the rules for the same mail when one of them reads it ([`read_beside`]), any of
+/// which may then take mail it didn't (a stop, or a category an exception looks for); a rename,
+/// the rules it rewrites ([`renamed_rules`]), which then give mail the new name, chosen by the
+/// call. Those that run on new mail count, as for the rule calls.
+fn beside_makes_in_outlook(s: &Session, id: &str, params: &Value) -> Vec<(String, Id)> {
+    let mb = &s.mailbox;
+    let mut out = Vec::new();
+    // The rules for the mail of `account` (0: each for whichever mail it is for) that a change of
+    // what `reads` reads reaches; every rule for that mail when nothing in particular is read.
+    let reached = |account: Id, reads: Option<fn(&mailcraft_model::Rule) -> bool>| {
+        mb.rules.iter().filter(move |r| {
+            runs_on_new_mail(r) && (account == 0 || r.is_for(account)) && reads.is_none_or(|reads| read_beside(mb, account, r, reads))
+        })
+    };
+    match id {
+        _ if id.starts_with("junk.") => {
+            for a in junk_lets_through(s, id, params) {
+                for r in reached(a, None) {
+                    rule_makes_in_outlook(mb, r, Some(a), Counted::Alone, &mut out);
+                }
+            }
+        }
+        "account.edit" => {
+            if let Some(a) = me_changes(s, id, params) {
+                for r in reached(a, Some(reads_me)) {
+                    rule_makes_in_outlook(mb, r, Some(a), Counted::Alone, &mut out);
+                }
+            }
+        }
+        "view.timeZone" if zone_changes(s, id, params) => {
+            for r in reached(0, Some(reads_days)) {
+                rule_makes_in_outlook(mb, r, one_account(r), Counted::Alone, &mut out);
+            }
+        }
+        "category.rename" => {
+            let (Ok(account), Some(from), Some(to)) = (crate::cmd::category::list_account(s, params), p::str(params, "from"), p::str(params, "to"))
+            else {
+                return out;
+            };
+            // The rename made as the command makes it, on a copy of the mailbox without its items,
+            // which the rules don't read for this: the lists and the rules as it leaves them. One
+            // it refuses changes nothing.
+            let mut after = mb.clone();
+            after.messages = Default::default();
+            after.contacts.clear();
+            after.events.clear();
+            after.tasks.clear();
+            after.notes.clear();
+            after.journal.clear();
+            if after.rename_category(account, from, to).is_err() {
+                return out;
+            }
+            // What the rules give mail that is new on a list kept in step with Outlook then, and
+            // wasn't before: the new name a rule follows it to, where that list hasn't got it, and
+            // the old name a rule it leaves as it was still gives, where the list renamed had it.
+            let before = rules_in_outlook(mb);
+            out.extend(rules_in_outlook(&after).into_iter().filter(|made| !had(&before, made)));
+            // And a rule whose condition or exception names the category takes or leaves alone
+            // other mail then (it reads both names; a rename only of the letters' case reads the
+            // same): all it gives that mail, and all the rules after it give, counts.
+            // So does a rule that looks for the new name, which the mail renamed and the mail
+            // given it carry then.
+            let Some(to) = mailcraft_model::clean_name(to) else { return out };
+            if !mailcraft_model::sync::same_category(from.trim(), &to) {
+                for (was, now) in mb.rules.iter().zip(&after.rules) {
+                    let reads = was.conditions != now.conditions || was.exceptions != now.exceptions || now.names_category(&to, false);
+                    if runs_on_new_mail(now) && reads {
+                        rule_makes_in_outlook(&after, now, one_account(now), Counted::WithOthers, &mut out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Whose categories [`rule_makes_in_outlook`] counts: the rule's alone (a rule run by itself, or
+/// each of the rules a run goes through), the rule's and those of the rules that run with it (a
+/// rule made, switched on, moved or kept elsewhere: which of the others match, stop or are
+/// moved to then changes), or only theirs (a rule switched off or deleted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Counted {
+    Alone,
+    WithOthers,
+    Others,
+}
+
+/// [`rules_make_in_outlook`] for one rule, giving the mail of `from` (every account's, `None`) its
+/// categories, and, as `counted` says, those of the rules that run on the same mail. The mail may
+/// have been moved to another account by then, by this rule or by one that runs before it
+/// ([`Mailbox::run_rules`] runs the rules of the account the mail came to, in their order,
+/// wherever an earlier one moved it), or a move may have been refused (a message not downloaded
+/// whole, say), and a copy made into another account's folder carries them there (#566): every
+/// list it may be on is named. What each rule matches, where it stands and
+/// whether one before it stops the rest are not worked out: whatever they give may be given.
+fn rule_makes_in_outlook(mb: &Mailbox, r: &mailcraft_model::Rule, from: Option<Id>, counted: Counted, out: &mut Vec<(String, Id)>) {
+    let mut accounts: Vec<Id> = match from {
+        Some(a) => vec![a],
+        None => mb.accounts.iter().map(|a| a.id).collect(),
+    };
+    // (A rule puts nothing into a send queue, nor into a folder that is gone.)
+    let runs_with = |x: &mailcraft_model::Rule| from.is_none_or(|a| x.is_for(a));
+    let moved_to: Vec<Id> = mb
+        .rules
+        .iter()
+        .filter(|x| runs_with(x))
+        .chain(std::iter::once(r))
+        .flat_map(|x| x.actions.iter())
+        .filter_map(|action| match action {
+            mailcraft_model::Action::MoveTo(folder) | mailcraft_model::Action::CopyTo(folder) => {
+                mb.folder(*folder).filter(|f| !mb.is_send_queue(f.id)).map(|f| f.account)
+            }
+            _ => None,
+        })
+        .collect();
+    for account in moved_to {
+        if !accounts.contains(&account) {
+            accounts.push(account);
+        }
+    }
+    let own = (counted != Counted::Others).then_some(r);
+    let others = mb.rules.iter().filter(|x| counted != Counted::Alone && x.id != r.id && runs_on_new_mail(x) && runs_with(x));
+    let given = own.into_iter().chain(others).flat_map(|x| x.actions.iter());
+    for action in given {
+        let mailcraft_model::Action::Categorize(name) = action else { continue };
+        let Some(name) = mailcraft_model::clean_name(name) else { continue };
+        for account in &accounts {
+            let Some(owner) = writable_list(mb, *account) else { continue };
+            let known = out.iter().any(|(n, o)| *o == owner && mailcraft_model::sync::same_category(n, &name));
+            if mb.category_of(*account, &name).is_none() && !known {
+                out.push((name.clone(), owner));
+            }
+        }
+    }
+}
+
+/// What [`makes_in_outlook`] makes there for a call that gives an item or a rule categories, said
+/// after what the call does; empty for nothing.
+fn made_in_outlook_suffix(s: &Session, id: &str, params: &Value) -> String {
+    let by_rules = RUNS_RULES.contains(&id) || changes_beside_rules(id);
+    if !GIVES_CATEGORIES.contains(&id) && !by_rules {
+        return String::new();
+    }
+    let Some(made) = makes_in_outlook(s, id, params) else { return String::new() };
+    made_suffix(s, &made, by_rules)
+}
+
+/// [`made_in_outlook_suffix`] for what is made (`by_rules`: what the rules give mail).
+fn made_suffix(s: &Session, made: &MadeInOutlook, by_rules: bool) -> String {
+    let whose: Vec<String> = made.owners.iter().filter_map(|o| s.mailbox.account(*o)).map(|a| quoted(&a.email)).collect();
+    let whose = if whose.is_empty() { String::new() } else { format!(" of {}", some(&whose, 3)) };
+    let names: Vec<String> = made.names.iter().map(|n| quoted(n)).collect();
+    let (what, it, is) = match names.as_slice() {
+        [one] => (format!("the category {one}"), "it", "is"),
+        many => (format!("the categories {}", some(many, 3)), "they", "are"),
+    };
+    if by_rules {
+        format!("; the rules give mail {what}, new on the list{whose}, which is kept in step with Outlook, so {it} {is} made in Outlook too")
+    } else {
+        format!("; {what} {is} new on the list{whose}, which is kept in step with Outlook, and {is} made in Outlook too")
+    }
+}
+
+/// What [`makes_in_outlook`] makes there, said after what the call does (`on`: what a Categorize
+/// call puts it on); empty for nothing.
+fn made_in_outlook_text(s: &Session, id: &str, params: &Value) -> String {
+    let Some(made) = makes_in_outlook(s, id, params) else { return String::new() };
+    let whose: Vec<String> = made.owners.iter().filter_map(|o| s.mailbox.account(*o)).map(|a| quoted(&a.email)).collect();
+    let whose = if whose.is_empty() { String::new() } else { format!(" of {}", some(&whose, 3)) };
+    let name = made.names.iter().map(|n| quoted(n)).next().unwrap_or_default();
+    let on = match id {
+        "mail.categorize" => messages_text(s, &p::ids_strict(params).ok().flatten().unwrap_or_else(|| s.sel.messages.clone())),
+        "tasks.categorize" => {
+            let t = p::id_strict(params, "id").ok().and_then(|t| t.or(s.sel.task)).and_then(|t| s.mailbox.task(t));
+            format!("the task {}", t.map(|t| quoted(&t.title)).unwrap_or_else(|| "(none selected)".to_string()))
+        }
+        "people.categorize" => {
+            let c = p::id_strict(params, "id").ok().and_then(|c| c.or(s.sel.contact)).and_then(|c| s.mailbox.contact(c));
+            format!("the contact {}", c.map(|c| quoted(&c.name())).unwrap_or_else(|| "(none selected)".to_string()))
+        }
+        "calendar.categorize" => event_title(s, id, params),
+        _ if made.made => {
+            return format!("make the category {name} on the list{whose}, which is kept in step with Outlook: it is made in Outlook too");
+        }
+        _ => return format!("give the category {name}{whose} another colour, in Outlook too"),
+    };
+    format!("put the category {name} on {on}; it is new on the list{whose}, which is kept in step with Outlook, and is made in Outlook too")
+}
+
+/// The text of the refusal a change of a list of categories gets when MailCraft may not change
+/// that list in Outlook (#661), as the command would refuse it: before anything about Outlook is
+/// asked. `None` for any other list, or a call that names no account as the command reads it.
+fn read_only_categories(s: &Session, id: &str, params: &Value) -> Option<String> {
+    let account = match id {
+        "category.set" | "category.rename" | "category.remove" => crate::cmd::category::list_account(s, params).ok()?,
+        "category.addToOutlook" => p::req_id(params, "account").ok()?,
+        _ => return None,
+    };
+    let owner = s.mailbox.categories_read_only(account)?;
+    let address = s.mailbox.account(owner).map(|a| a.email.trim().to_string()).unwrap_or_default();
+    Some(mailcraft_model::categories_read_only_text(&address))
+}
+
+/// Whether `id` renames or deletes a category that a to-do in a shared list has: the to-do is
+/// changed with it, and the people the list is shared with see that.
+fn shared_category(s: &Session, id: &str, params: &Value) -> bool {
+    let key = match id {
+        "category.rename" => "from",
+        "category.remove" => "name",
+        _ => return false,
+    };
+    let Some(name) = p::str(params, key).map(str::trim) else { return false };
+    // The command changes the to-dos that use the list it names.
+    let list = s.mailbox.category_list_owner(p::id(params, "account").unwrap_or(0));
+    let on_list = |t: &Task| s.mailbox.category_list_owner(t.origin.account) == list;
+    s.mailbox
+        .tasks
+        .values()
+        .any(|t| t.categories.iter().any(|c| mailcraft_model::sync::same_category(c, name)) && on_list(t) && s.mailbox.in_shared_task_list(t))
+}
+
+/// Whether going from `before` to `after` changes the owner's answer about their local to-dos, or
+/// puts a to-do on its way to an account's To Do that it wasn't on its way to, where
+/// [`new_task_onto`] would ask.
+pub(crate) fn places_tasks(before: &Mailbox, after: &Mailbox) -> bool {
+    let home = crate::cmd::tasks_remote::tasks_home(before);
+    let placed = |(k, t): (&Id, &std::sync::Arc<Task>)| {
+        let waiting = t.origin.account != 0 && t.origin.id.is_empty() && !t.local_only && Some(t.origin.account) != home;
+        waiting && before.tasks.get(k).is_none_or(|b| b.origin.account != t.origin.account)
+    };
+    before.local_tasks != after.local_tasks || after.tasks.iter().any(placed)
+}
+
+/// Whether going from `before` to `after` changes what a list shared with other people has, as
+/// the next Send/Receive of to-dos would tell its server: a to-do in one changed, brought back or
+/// added, or one deleted from one.
+pub(crate) fn changes_shared_tasks(before: &Mailbox, after: &Mailbox) -> bool {
+    if after.shared_task_lists.is_empty() && before.shared_task_lists.is_empty() {
+        return false;
+    }
+    // Only what goes to the server counts (a to-do's message, say, doesn't); one moved out of a
+    // shared list counts too.
+    let changed = after.tasks.iter().any(|(k, t)| match before.tasks.get(k) {
+        None => after.in_shared_task_list(t),
+        Some(b) => (after.in_shared_task_list(t) || before.in_shared_task_list(b)) && !std::sync::Arc::ptr_eq(b, t) && !b.same_on_server(t),
+    });
+    if changed || after.task_gone == before.task_gone {
+        return changed;
+    }
+    let told: std::collections::HashSet<(Id, &str)> = before.task_gone.iter().map(|g| (g.account, g.id.as_str())).collect();
+    after
+        .task_gone
+        .iter()
+        .any(|g| !told.contains(&(g.account, g.id.as_str())) && before.shared_task_lists.get(&g.account).is_some_and(|l| l.contains(g.list.as_str())))
+}
+
+fn is_outbox(mb: &Mailbox, folder: Id) -> bool {
+    mb.folder(folder).is_some_and(|f| f.kind == FolderKind::Outbox)
+}
+
+/// Whether a message `params` names (or the selection) goes onto the server of the account of
+/// `folder` from another account or from this computer (#451), where others may read it too (a
+/// shared mailbox): asked as a send. Named wrongly, none goes: the command refuses them.
+fn onto_another_server(s: &Session, params: &Value, folder: Id) -> bool {
+    let Some(to) = s.mailbox.folder(folder).map(|f| f.account) else { return false };
+    let Ok(named) = p::ids_strict(params) else { return false };
+    let ids = named.unwrap_or_else(|| s.sel.messages.clone());
+    ids.iter().filter_map(|id| s.mailbox.message(*id)).any(|m| s.mailbox.placed_into(m.account, to))
+}
+
+/// The account on whose server mail moved into `folder` from the account it came to (`from`;
+/// any, for new mail) is put (#451).
+fn folder_onto_server(s: &Session, folder: Id, from: Option<Id>) -> Option<Id> {
+    let mb = &s.mailbox;
+    mb.folder(folder).map(|f| f.account).filter(|to| match from {
+        Some(from) => mb.placed_into(from, *to),
+        None => mb.accounts.iter().any(|a| mb.placed_into(a.id, *to)),
+    })
+}
+
+/// [`folder_onto_server`] of a rule's moves and copies: the first.
+fn rule_onto_server(s: &Session, r: &mailcraft_model::Rule, from: Option<Id>) -> Option<Id> {
+    r.actions.iter().find_map(|a| match a {
+        mailcraft_model::Action::MoveTo(f) | mailcraft_model::Action::CopyTo(f) => folder_onto_server(s, *f, from),
+        _ => None,
+    })
+}
+
+/// [`folder_onto_server`] of a rule's moves and copies, every account once, added to `onto`.
+fn rule_onto_servers(s: &Session, r: &mailcraft_model::Rule, from: Option<Id>, onto: &mut Vec<Id>) {
+    for a in &r.actions {
+        if let mailcraft_model::Action::MoveTo(f) | mailcraft_model::Action::CopyTo(f) = a
+            && let Some(to) = folder_onto_server(s, *f, from)
+            && !onto.contains(&to)
+        {
+            onto.push(to);
+        }
+    }
+}
+
+/// The servers of `accounts`, as a question names them: at most three, and how many more.
+fn servers_named(s: &Session, accounts: &[Id]) -> String {
+    let named: Vec<String> =
+        accounts.iter().take(3).map(|a| s.mailbox.account(*a).map_or_else(|| "another account".to_string(), |a| clip(&a.email, 80))).collect();
+    match accounts.len().saturating_sub(3) {
+        0 => named.join(", "),
+        more => format!("{} and {more} more", named.join(", ")),
+    }
+}
+
+/// The accounts whose new mail a change to the Safe or Blocked Senders lets through to the rules,
+/// as a rule before the others that stopped them would (the lists sort new mail first,
+/// [`Mailbox::sort_junk`]): taking a sender off the Blocked Senders, whose mail went to Junk
+/// E-mail, or putting one on the Safe Senders, whose mail the account's server put in Junk E-mail
+/// is taken out into the Inbox (#566). One that blocks more lets less through. Read as the commands
+/// read them.
+fn junk_lets_through(s: &Session, id: &str, params: &Value) -> Vec<Id> {
+    use mailcraft_model::JunkList;
+    let list = || p::str(params, "list").and_then(JunkList::parse);
+    match id {
+        "junk.add" if list() == Some(JunkList::Safe) => crate::cmd::junk::list_account(s, params).into_iter().collect(),
+        "junk.remove" if list() == Some(JunkList::Blocked) => crate::cmd::junk::list_account(s, params).into_iter().collect(),
+        "junk.neverBlockSender" | "junk.neverBlockDomain" => {
+            let ids = p::ids_strict(params).map(|m| m.unwrap_or_else(|| s.sel.messages.clone())).unwrap_or_default();
+            let mut accounts: Vec<Id> = Vec::new();
+            for a in ids.iter().filter_map(|m| s.mailbox.message(*m)).map(|m| s.mailbox.junk_owner(m.account)) {
+                if !accounts.contains(&a) {
+                    accounts.push(a);
+                }
+            }
+            accounts
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The account whose address an `account.edit` changes, read as the command reads it: the "me" of
+/// a rule's "sent to me" or "except if I'm in To" (#566), so that the change may let more mail
+/// reach a rule beside it that reads it ([`reads_me`]).
+fn me_changes(s: &Session, id: &str, params: &Value) -> Option<Id> {
+    if id != "account.edit" {
+        return None;
+    }
+    let account = p::id(params, "id").and_then(|a| s.mailbox.account(a))?;
+    let new = crate::cmd::account::edited(account, params)?;
+    (!new.email.trim().eq_ignore_ascii_case(account.email.trim())).then_some(account.id)
+}
+
+/// The rules a `category.rename` rewrites ([`Mailbox::rules_renaming`]), read as the command reads
+/// its params: a change to the rules for their mail (#566).
+fn renamed_rules<'a>(s: &'a Session, params: &Value) -> Vec<&'a mailcraft_model::Rule> {
+    let (Ok(account), Some(from)) = (crate::cmd::category::list_account(s, params), p::str(params, "from")) else { return Vec::new() };
+    s.mailbox.rules_renaming(account, from).into_iter().filter_map(|(i, _)| s.mailbox.rules.get(i)).collect()
+}
+
+/// What a question about a `category.rename` adds for the rules beside those it rewrites
+/// ([`renamed_rules`]) that put mail onto another server, as
+/// [`beside_said`] does for a change to the rules.
+fn rename_beside_said(s: &Session, params: &Value) -> String {
+    let mut said = String::new();
+    for r in renamed_rules(s, params) {
+        let more = beside_said_of(s, r.account, r.id, true, "renaming the category in the rules");
+        if !said.contains(&more) {
+            said.push_str(&more);
+        }
+    }
+    said
+}
+
+/// Whether a rule reads its account's address: a condition or an exception about "me".
+fn reads_me(r: &mailcraft_model::Rule) -> bool {
+    r.conditions.iter().chain(&r.exceptions).any(mailcraft_model::Condition::about_me)
+}
+
+/// What a question about a change of an account's address adds for the rules beside it that read
+/// that address ([`me_changes`]) and put mail onto another server: their
+/// names (at most five), and why.
+fn me_beside_said(s: &Session, account: Id) -> String {
+    reads_beside_said(s, account, reads_me, "this account's address (\"sent to me\", say)")
+}
+
+/// Whether a rule reads the days mail came, by the zone the calendar is shown in
+/// ([`mailcraft_model::Condition::ReceivedBetween`]).
+fn reads_days(r: &mailcraft_model::Rule) -> bool {
+    r.conditions.iter().chain(&r.exceptions).any(|c| matches!(c, mailcraft_model::Condition::ReceivedBetween { .. }))
+}
+
+/// Whether `view.timeZone` changes the zone that a rule reading the days mail came by
+/// ([`reads_days`]) reads them by (#566).
+fn zone_changes(s: &Session, id: &str, params: &Value) -> bool {
+    id == "view.timeZone" && crate::cmd::zones::rule_zone_after(s, params).is_some()
+}
+
+/// Whether `r`, a rule beside a change of something rules read (an account's address, the days
+/// mail came: `reads`), is reached by it: it reads that itself, or another rule switched on for
+/// the same mail (that of `account`; 0: whichever mail `r` is for) does, which may change what
+/// mail reaches `r` (a category its exception looks for, or a stop), as switching that rule off
+/// would (#566).
+fn read_beside(mb: &Mailbox, account: Id, r: &mailcraft_model::Rule, reads: fn(&mailcraft_model::Rule) -> bool) -> bool {
+    let mail = if account != 0 { account } else { r.account };
+    reads(r) || mb.rules.iter().any(|x| x.enabled && reads(x) && (x.account == 0 || mail == 0 || x.account == mail))
+}
+
+/// What a question about a change that rules switched on here read ([`me_beside_said`]) adds for
+/// those for the mail of `account` (0: every account's) that put mail onto another server, beside
+/// a rule that reads it ([`read_beside`]): their names (at most five), and that the rules for that
+/// mail read `what`.
+fn reads_beside_said(s: &Session, account: Id, reads: fn(&mailcraft_model::Rule) -> bool, what: &str) -> String {
+    let mb = &s.mailbox;
+    let onto: Vec<(String, Vec<Id>)> =
+        beside_onto_server(s, account, 0, true).filter(|(r, _)| read_beside(mb, account, r, reads)).map(|(r, to)| (quoted(&r.name), to)).collect();
+    if onto.is_empty() {
+        return String::new();
+    }
+    let more = onto.len().saturating_sub(5);
+    let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+    let names: Vec<String> = onto.iter().take(5).map(|(n, _)| n.clone()).collect();
+    let mut servers: Vec<Id> = Vec::new();
+    for to in onto.iter().flat_map(|(_, to)| to) {
+        if !servers.contains(to) {
+            servers.push(*to);
+        }
+    }
+    let server = servers_named(s, &servers);
+    by_count(
+        onto.len(),
+        "; the rule {names}{more}, switched on here, puts mail onto the server of {server}, and the rules for that mail read {what}, so changing it may let more mail reach it",
+        "; the rules {names}{more}, switched on here, put mail onto the server of {server}, and the rules for that mail read {what}, so changing it may let more mail reach them",
+        &[("names", &names.join(", ")), ("more", &more), ("server", &server), ("what", what)],
+    )
+}
+
+/// What a question about a change to the Safe or Blocked Senders adds for the rules that the mail
+/// it lets through reaches ([`junk_lets_through`]), as [`beside_said`] does for a change to the rules.
+fn junk_beside_said(s: &Session, id: &str, params: &Value) -> String {
+    let mut said = String::new();
+    for a in junk_lets_through(s, id, params) {
+        let more = beside_said_of(s, a, 0, true, "this change");
+        if !said.contains(&more) {
+            said.push_str(&more);
+        }
+    }
+    said
+}
+
+/// The rules switched on that copy or move mail onto another account's server and that a change
+/// to the rules of `account` reaches (for the same mail, and `rule` itself only when it is still
+/// on after the change, `on`), with those accounts: any change may let more mail reach them (#566).
+fn beside_onto_server(s: &Session, account: Id, rule: Id, on: bool) -> impl Iterator<Item = (&mailcraft_model::Rule, Vec<Id>)> {
+    s.mailbox
+        .rules
+        .iter()
+        .filter(move |x| x.enabled && (on || x.id != rule) && (x.account == 0 || account == 0 || x.account == account))
+        // (Of a rule for every account's mail, what it does with the mail of `account`.)
+        .filter_map(move |x| {
+            let mut onto = Vec::new();
+            rule_onto_servers(s, x, one_account(x).or((account != 0).then_some(account)), &mut onto);
+            (!onto.is_empty()).then_some((x, onto))
+        })
+}
+
+/// What a question about a change to the rules adds for the rules beside it that put mail on
+/// another account's server ([`beside_onto_server`]).
+fn beside_said(s: &Session, account: Id, rule: Id, on: bool) -> String {
+    beside_said_of(s, account, rule, on, "a change to the rules")
+}
+
+/// [`beside_said`], for `change`.
+fn beside_said_of(s: &Session, account: Id, rule: Id, on: bool, change: &str) -> String {
+    let mut said = String::new();
+    let onto: Vec<(String, Vec<Id>)> = beside_onto_server(s, account, rule, on).map(|(r, to)| (quoted(&r.name), to)).collect();
+    if !onto.is_empty() {
+        let more = onto.len().saturating_sub(5);
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        let names: Vec<String> = onto.iter().take(5).map(|(n, _)| n.clone()).collect();
+        let mut servers: Vec<Id> = Vec::new();
+        for to in onto.iter().flat_map(|(_, to)| to) {
+            if !servers.contains(to) {
+                servers.push(*to);
+            }
+        }
+        let server = servers_named(s, &servers);
+        said.push_str(&by_count(
+            onto.len(),
+            "; the rule {names}{more}, switched on, puts mail onto the server of {server}, and {change} may let more mail reach it",
+            "; the rules {names}{more}, switched on, put mail onto the server of {server}, and {change} may let more mail reach them",
+            &[("names", &names.join(", ")), ("more", &more), ("server", &server), ("change", change)],
+        ));
+    }
+    said
+}
+
+/// The accounts whose rules an undo or redo from the rules of `now` to those of `to` changes (0:
+/// every account's): of each rule made, changed or taken away, and of each account whose rules
+/// run in another order (one moved past another for the same mail); not of those that only take
+/// another place in the list, as one is made, taken away or moved past them; and of each account
+/// whose Safe or Blocked Senders let more mail through to the rules after it, as
+/// [`junk_lets_through`] reads a change to them, or whose address a rule reads ([`me_changes`]).
+/// None when the rules, the lists and those addresses stay as they are.
+fn changed_accounts(now: &Mailbox, to: &Mailbox) -> Vec<Id> {
+    let lists = |m: &Mailbox, a: Id| m.junk_accounts.get(&a).cloned().unwrap_or_default();
+    let mut changed: Vec<Id> = now
+        .junk_accounts
+        .keys()
+        .chain(to.junk_accounts.keys())
+        .copied()
+        .filter(|a| {
+            let (now, to) = (lists(now, *a), lists(to, *a));
+            to.safe.iter().any(|e| !now.safe.contains(e)) || now.blocked.iter().any(|e| !to.blocked.contains(e))
+        })
+        .collect();
+    // And of each account whose address changes, which a rule of its mail reads ([`me_changes`]).
+    // (By A to Z's case, as a rule reads "me" and [`me_changes`] compares.)
+    let email = |m: &Mailbox, a: Id| m.account(a).map(|x| x.email.trim().to_ascii_lowercase());
+    changed.extend(
+        now.accounts
+            .iter()
+            .map(|a| a.id)
+            .filter(|a| email(now, *a) != email(to, *a) && to.rules.iter().any(|r| (r.account == 0 || r.account == *a) && reads_me(r))),
+    );
+    if to.rules == now.rules {
+        changed.sort_unstable();
+        changed.dedup();
+        return changed;
+    }
+    let made_or_changed = |a: &Mailbox, b: &Mailbox| -> Vec<Id> { a.rules.iter().filter(|r| !b.rules.contains(r)).map(|r| r.account).collect() };
+    changed.extend(made_or_changed(to, now));
+    changed.extend(made_or_changed(now, to));
+    // The rules both have, in the order they run for an account's mail on each side.
+    let ids = |m: &Mailbox| -> std::collections::HashSet<Id> { m.rules.iter().map(|r| r.id).collect() };
+    let (in_now, in_to) = (ids(now), ids(to));
+    let order = |m: &Mailbox, account: Id| -> Vec<Id> {
+        m.rules_in_order(account)
+            .into_iter()
+            .filter_map(|i| m.rules.get(i))
+            .map(|r| r.id)
+            .filter(|id| in_now.contains(id) && in_to.contains(id))
+            .collect()
+    };
+    let accounts: std::collections::BTreeSet<Id> = now.accounts.iter().chain(&to.accounts).map(|a| a.id).collect();
+    changed.extend(accounts.into_iter().filter(|a| order(now, *a) != order(to, *a)));
+    changed.sort_unstable();
+    changed.dedup();
+    changed
+}
+
+/// Whether a change to the rules of `changed` ([`changed_accounts`]) reaches rule `r`: for the
+/// same mail.
+fn reached(changed: &[Id], r: &mailcraft_model::Rule) -> bool {
+    changed.iter().any(|a| *a == 0 || r.account == 0 || *a == r.account)
+}
+
+/// The accounts on whose servers rules file mail, when an undo or redo from the rules of the
+/// mailbox now to those of `to` changes them and leaves such rules switched on (#566): any change
+/// may let more mail reach them.
+pub(crate) fn undo_rules_onto_another_server(s: &Session, to: &Mailbox) -> Vec<Id> {
+    undo_rules_onto_named(s, to).1
+}
+
+/// [`undo_rules_onto_another_server`], and the names of those rules, quoted, in their order.
+pub(crate) fn undo_rules_onto_named(s: &Session, to: &Mailbox) -> (Vec<String>, Vec<Id>) {
+    let changed = changed_accounts(&s.mailbox, to);
+    let (mut names, mut onto) = (Vec::new(), Vec::new());
+    for r in to.rules.iter().filter(|r| r.enabled && reached(&changed, r)) {
+        // (Its own servers, so that a rule onto a server another one names is named too.)
+        let mut its = Vec::new();
+        match one_account(r) {
+            Some(a) => rule_onto_servers(s, r, Some(a), &mut its),
+            // A rule for every account's mail: what it does with the mail of the accounts whose
+            // rules the step changes, as `beside_onto_server` reads it; every account's when it is
+            // changed itself.
+            None if changed.contains(&0) => rule_onto_servers(s, r, None, &mut its),
+            None => {
+                for a in &changed {
+                    rule_onto_servers(s, r, Some(*a), &mut its);
+                }
+            }
+        }
+        if !its.is_empty() {
+            names.push(quoted(&r.name));
+        }
+        for a in its {
+            if !onto.contains(&a) {
+                onto.push(a);
+            }
+        }
+    }
+    (names, onto)
+}
+
+/// Whether this command puts a rule that deletes mail on its server, or switches one on there:
+/// it runs there whether MailCraft is open or not, undo doesn't reach it, and the agent couldn't
+/// delete it again itself (#566). What a rule with parts not known here does isn't known: it may
+/// delete mail, or send it away.
+fn server_rule_deletes(s: &Session, id: &str, params: &Value) -> bool {
+    let named = || p::id(params, "id").and_then(|r| s.mailbox.rules.iter().find(|x| x.id == r));
+    // Moving mail into Deleted Items, or a folder under it, is deleting it.
+    let binned = |id: &Id| s.mailbox.folders.iter().filter(|f| f.kind == FolderKind::Deleted).any(|f| s.mailbox.subtree(f.id).contains(id));
+    let deletes = |r: &mailcraft_model::Rule| {
+        !r.known()
+            || r.actions.iter().any(|a| match a {
+                mailcraft_model::Action::Delete => true,
+                mailcraft_model::Action::MoveTo(f) => binned(f),
+                _ => false,
+            })
+    };
+    let there = |r: &mailcraft_model::Rule| r.keep == mailcraft_model::Keep::Server;
+    match id {
+        "rules.add" => crate::cmd::rules::rule_from_params(s, params).is_ok_and(|r| there(&r) && deletes(&r)),
+        "rules.fromMessage" => crate::cmd::rules::rule_from_message(s, params).is_ok_and(|(r, _)| there(&r) && deletes(&r)),
+        "rules.keepOnServer" => crate::cmd::rules::keeping_on_server(s, params).is_ok_and(|(_, r, _)| !there(&r) && deletes(&r)),
+        // Moving a server rule that deletes mail changes where it runs among the others there.
+        "rules.move" => named().is_some_and(|r| there(r) && deletes(r)),
+        // Read as the command reads it, as `rules_onto_another_server` does.
+        "rules.enable" => {
+            p::opt_bool(params, "value").is_ok_and(|value| named().is_some_and(|r| value.unwrap_or(!r.enabled) && there(r) && deletes(r)))
+        }
+        _ => false,
+    }
+}
+
+/// The account whose mail a rule files, or `None` for a rule for every account's.
+/// The rule `rules.keepOnServer` would keep on a server, as it would be there: for the mail of
+/// that server's account alone. None when the command refuses it.
+fn kept_on_server(s: &Session, params: &Value) -> Option<mailcraft_model::Rule> {
+    crate::cmd::rules::keeping_on_server(s, params).ok().map(|(_, r, account)| mailcraft_model::Rule { account, ..r })
+}
+
+/// [`kept_on_server`], with whose rules keeping it changes, as [`beside_onto_server`] reads them (an account, and whether the rule is still on for its mail):
+/// the server's account, where it runs before the rules of this computer; or, for a rule for
+/// every account's mail, every account, the others' mail now left to the rules after it (#566).
+fn kept_reach(s: &Session, params: &Value) -> Option<(mailcraft_model::Rule, Id, bool)> {
+    let every = p::id(params, "id").and_then(|r| s.mailbox.rules.iter().find(|x| x.id == r)).is_some_and(|r| r.account == 0);
+    kept_on_server(s, params).map(|r| {
+        let (account, on) = if every { (0, false) } else { (r.account, true) };
+        (r, account, on)
+    })
+}
+
+fn one_account(r: &mailcraft_model::Rule) -> Option<Id> {
+    (r.account != 0).then_some(r.account)
+}
+
+/// Whether a command on the rules deletes where undo doesn't reach (#566): a rule that deletes
+/// put on its server or switched on there ([`server_rule_deletes`]), or a rule its server has
+/// deleted there, as `tasks.delete` (MailCraft may not be able to make it again); so is one that
+/// went to be made there and had no answer, which the server may have. Asked as a delete, and
+/// beside a send as both ([`also`]).
+fn rules_delete(s: &Session, id: &str, params: &Value) -> bool {
+    let there = |x: &mailcraft_model::Rule| x.on_server() || x.unanswered;
+    server_rule_deletes(s, id, params)
+        || (id == "rules.remove" && p::id(params, "id").is_some_and(|r| s.mailbox.rules.iter().any(|x| x.id == r && there(x))))
+}
+
+/// Whether the rules this command makes, switches on or runs put mail on another account's
+/// server (#451); or whether it changes the rules for mail that a rule switched on puts there:
+/// any change may let more mail reach that one (a rule before it that stopped the others, or one
+/// that sets a category or a flag it looks for, #566). Switching that rule off or deleting it only
+/// puts less there.
+fn rules_onto_another_server(s: &Session, id: &str, params: &Value) -> bool {
+    let mb = &s.mailbox;
+    let named = || p::id(params, "id").and_then(|r| mb.rules.iter().find(|x| x.id == r));
+    let onto = |r: &mailcraft_model::Rule| rule_onto_server(s, r, one_account(r)).is_some();
+    let beside = |account: Id, rule: Id, on: bool| beside_onto_server(s, account, rule, on).next().is_some();
+    match id {
+        // A change to the Safe or Blocked Senders that lets more mail through to the rules.
+        _ if id.starts_with("junk.") => junk_lets_through(s, id, params).into_iter().any(|a| beside(a, 0, true)),
+        // A change of the address a rule beside it reads.
+        "account.edit" => me_changes(s, id, params).is_some_and(|a| beside_onto_server(s, a, 0, true).any(|(r, _)| read_beside(mb, a, r, reads_me))),
+        // A change of the zone a rule beside it reads the days mail came by.
+        "view.timeZone" => zone_changes(s, id, params) && beside_onto_server(s, 0, 0, true).any(|(r, _)| read_beside(mb, 0, r, reads_days)),
+        // A rename that rewrites the rules for the same mail.
+        "category.rename" => renamed_rules(s, params).iter().any(|r| beside(r.account, r.id, true)),
+        // A rule for one account files that account's new mail; one for every account, every
+        // account's.
+        "rules.add" => crate::cmd::rules::rule_from_params(s, params).is_ok_and(|r| onto(&r) || beside(r.account, 0, true)),
+        "rules.fromMessage" => crate::cmd::rules::rule_from_message(s, params).is_ok_and(|(r, _)| onto(&r) || beside(r.account, 0, true)),
+        // Read as the commands read them: what they refuse does nothing, and needs no question.
+        "rules.enable" => p::opt_bool(params, "value").is_ok_and(|value| {
+            named().is_some_and(|r| {
+                let on = value.unwrap_or(!r.enabled);
+                (on && onto(r)) || beside(r.account, r.id, on)
+            })
+        }),
+        "rules.move" | "rules.remove" => named().is_some_and(|r| beside(r.account, r.id, id != "rules.remove")),
+        // (One kept there already changes nothing.)
+        "rules.keepOnServer" => {
+            kept_reach(s, params).is_some_and(|(r, account, on)| r.keep != mailcraft_model::Keep::Server && beside(account, r.id, on))
+        }
+        // The rules that run over the folder: those for its account's mail, or the one named.
+        "rules.run" => {
+            let (Ok(folder), Ok(only)) = (p::id_strict(params, "folder"), p::id_strict(params, "id")) else { return false };
+            let from = mb.folder(folder.unwrap_or(s.view.folder)).map(|f| f.account).filter(|a| mb.rules_reach(*a));
+            from.is_some_and(|a| {
+                mb.rules.iter().any(|r| r.enabled && r.is_for(a) && only.is_none_or(|o| o == r.id) && rule_onto_server(s, r, Some(a)).is_some())
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Deleting this message removes it (it is in Deleted Items, or its account has none).
+fn deletes_for_good(mb: &Mailbox, id: Id) -> bool {
+    let Some(m) = mb.message(id) else { return false };
+    match mb.folder_of_kind(m.account, FolderKind::Deleted) {
+        Some(d) => mb.subtree(d).contains(&m.folder),
+        None => true,
+    }
+}
+
+/// What the gate says about one call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Run,
+    /// Needs the owner's yes for `Class`; the text says what it would do.
+    Ask(Class, String),
+    Refuse(String),
+}
+
+/// The messages an agent's Delete or Move names, read as the command reads them (#503): never the
+/// selection, which is the owner's ([`NEEDS_IDS`]).
+fn taken(params: &Value) -> Vec<Id> {
+    p::ids_strict(params).ok().flatten().unwrap_or_default()
+}
+
+/// Where unsubscribing from message `id` by mail writes, and with what subject, when its list
+/// unsubscribes by mail (as its headers say: data, never instructions).
+fn unsubscribe_mail(s: &Session, id: Id) -> Option<String> {
+    let m = s.mailbox.message(id)?;
+    match mailcraft_model::unsubscribe::way(s.mailbox.account(m.account), m)? {
+        mailcraft_model::unsubscribe::Way::Mail { to, subject, .. } => {
+            let subject = if subject.trim().is_empty() { "Unsubscribe".to_string() } else { subject };
+            // Whole: what is written is what is shown (the address bounds both: 254 and 200).
+            Some(format!("to {} with the subject \u{201c}{}\u{201d}", clip(&to, 254), clip(&subject, 200)))
+        }
+        _ => None,
+    }
+}
+
+/// Commands that destroy, move, send from or open messages, or are costly: an agent names the
+/// messages (`ids`, or `id`), never leaving them to the window's selection, which the owner may
+/// have changed a moment ago (#620). The owner's own runs keep the selection.
+pub const NEEDS_IDS: &[&str] = &[
+    "mail.delete",
+    "mail.deletePermanently",
+    "mail.move",
+    "mail.snooze",
+    "mail.unsnooze",
+    "mail.setGmailCategory",
+    "mail.copy",
+    "mail.archive",
+    "mail.junk",
+    "mail.notJunk",
+    "mail.reply",
+    "mail.replyAll",
+    "mail.replyAndDelete",
+    "mail.forward",
+    "mail.forwardAsAttachment",
+    "mail.editDraft",
+    "mail.resend",
+    "mail.removeAttachment",
+    "mail.react",
+    "mail.sendAgain",
+    "mail.cancelSend",
+    "mail.setSendTime",
+    // Reaches every list of the messages it names (#1207): named by `ids`, never the selection.
+    "ui.unsubscribeMany",
+];
+
+/// The commands of [`NEEDS_IDS`] that act on one message ([`p::message_strict`]).
+const ONE_MESSAGE: &[&str] = &[
+    "mail.reply",
+    "mail.replyAll",
+    "mail.replyAndDelete",
+    "mail.editDraft",
+    "mail.resend",
+    "mail.react",
+    "mail.sendAgain",
+    "mail.cancelSend",
+    "mail.setSendTime",
+];
+
+/// The refusal for a command in [`NEEDS_IDS`] given no messages.
+pub fn needs_ids(id: &str) -> String {
+    format!(
+        "`{id}` needs `ids` (or `id`): an agent names the messages, as `mail.list` shows them, and doesn't act on what the owner has selected in the window"
+    )
+}
+
+/// The gate: `allow` is what the owner allowed in advance.
+pub fn check(s: &Session, id: &str, params: &Value, allow: &[Class]) -> Verdict {
+    verdict(s, id, params, allow, None)
+}
+
+/// The gate again once the owner has said yes to `yes` in the window: it runs when that is still
+/// all it asks for (what it would do may have changed while the question was up).
+pub fn answered(s: &Session, id: &str, params: &Value, allow: &[Class], yes: Class) -> Verdict {
+    verdict(s, id, params, allow, Some(yes))
+}
+
+/// What a call classed `class` needs besides it, which the question about `class` names and a yes
+/// to it covers: an undo or redo that puts back the accounts and also what goes to a server
+/// (a change that writes to people, mail or a rule on its way onto another account's server
+/// (#566), a category for Outlook, rules that give mail one) needs Send too; one that puts back
+/// the accounts (or a change that writes to people) and takes away messages, drafts, contacts or
+/// the like needs Delete too, as `edit.undo` refuses to take messages without it (#473); so does
+/// deleting a category a to-do in a shared list has (asked as `send`) when it goes from Outlook
+/// too (#661); a rule call needs Send for a category made in Outlook and Delete for a rule
+/// deleted on its server or one there that deletes mail, whichever it is asked about (#661), and
+/// the Settings it is besides, whatever it is asked as; so does an undo or redo that puts back
+/// rules, signatures or Safe and Blocked Senders. A change of an account's address asked as a
+/// send for a rule beside it (one that puts mail onto another server, or makes a category in
+/// Outlook) needs the Accounts too (#566, #661), and a change of the Safe or Blocked Senders so
+/// asked the Settings. Asked about as one question, so that the owner's yes lets it
+/// run.
+pub fn also(s: &Session, id: &str, params: &Value, class: Class) -> Vec<Class> {
+    match id {
+        // A change of an account's address asked as a send for a rule beside it that reads the
+        // address ([`me_changes`]) is still a change to the account (#566).
+        "account.edit" if class == Class::Send => vec![Class::Accounts],
+        "edit.undo" | "edit.redo" => {
+            let redo = id == "edit.redo";
+            let mut more = Vec::new();
+            // (Only the accounts come before what is sent in [`Session::undo_reverts`]: what
+            // writes to people, puts mail or a rule on its way onto another account's server,
+            // #566, or has a category go to Outlook, #661.)
+            let sends = || {
+                s.undo_sends(redo)
+                    || !s.undo_sends_categories(redo).is_empty()
+                    || !s.undo_makes_categories(redo).is_empty()
+                    || !s.undo_renames_on_server(redo).is_empty()
+                    || !s.undo_rules_make_categories(redo).is_empty()
+            };
+            if class == Class::Accounts && sends() {
+                more.push(Class::Send);
+            }
+            if class != Class::Delete && s.undo_deletes(redo) {
+                more.push(Class::Delete);
+            }
+            // Rules and the like put back are a change of settings, whatever else the step does.
+            if class != Class::Settings && s.undo_changes_settings(redo) {
+                more.push(Class::Settings);
+            }
+            more
+        }
+        // A category a to-do in a shared list has is deleted as `send` asks; one that goes from
+        // Outlook too, where an undo only makes it anew, needs Delete as well (#661).
+        "category.remove" if class != Class::Delete && removes_in_outlook(s, params) => vec![Class::Delete],
+        // A rule call asked about for one reason needs the others too: a category made in Outlook
+        // is a send, and a rule deleted on its server, or one there that deletes mail, a delete
+        // (#661, [`rules_delete`]); so does one asked as a send for a rule beside it that puts mail
+        // onto another server (#566).
+        _ if RUNS_RULES.contains(&id) => {
+            let mut more = Vec::new();
+            if class != Class::Send && makes_in_outlook(s, id, params).is_some() {
+                more.push(Class::Send);
+            }
+            if class != Class::Delete && rules_delete(s, id, params) {
+                more.push(Class::Delete);
+            }
+            // A change of rules is a change of settings, whatever else it is asked as.
+            if let Some(Access::Owner(base)) = access(id)
+                && base != class
+                && !more.contains(&base)
+            {
+                more.push(base);
+            }
+            more
+        }
+        // A change asked as a send for a rule beside it that puts mail onto another server, or
+        // makes a category in Outlook, is still what it is besides: one of the Safe or Blocked
+        // Senders a change of settings (#566, #661).
+        _ if class == Class::Send
+            && id.starts_with("junk.")
+            && (rules_onto_another_server(s, id, params) || makes_in_outlook(s, id, params).is_some()) =>
+        {
+            vec![Class::Settings]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn verdict(s: &Session, id: &str, params: &Value, allow: &[Class], yes: Option<Class>) -> Verdict {
+    if access(id).is_none() {
+        return Verdict::Refuse(format!("`{id}` isn't available to agents"));
+    }
+    if let Some(key) = file_named(id, params) {
+        return Verdict::Refuse(no_paths(id, key));
+    }
+    // Named as the command reads them (#451, #503, #553): ids named wrongly are refused, never asked about as
+    // the selection or as some of what was named.
+    if NEEDS_IDS.contains(&id) {
+        match p::ids_strict(params) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Verdict::Refuse(needs_ids(id)),
+            Err(e) => return Verdict::Refuse(format!("{} ({e})", needs_ids(id))),
+        }
+        if ONE_MESSAGE.contains(&id)
+            && let Err(e) = p::message_strict(params)
+        {
+            return Verdict::Refuse(format!("`{id}`: {e}"));
+        }
+    }
+    // Add to Tasks may take the selection, but a message named wrongly is refused all the same.
+    if id == "tasks.fromMessage"
+        && let Err(e) = p::message_strict(params)
+    {
+        return Verdict::Refuse(format!("`{id}`: {e}"));
+    }
+    // The owner is asked about the list the command would change, or about nothing (#504).
+    if matches!(id, "junk.add" | "junk.remove") && p::str(params, "list").and_then(mailcraft_model::JunkList::parse).is_none() {
+        return Verdict::Refuse(format!("`{id}` needs `list`: \"safe\" or \"blocked\""));
+    }
+    if matches!(id, "junk.add" | "junk.remove" | "junk.list")
+        && let Err(e) = crate::cmd::junk::list_account(s, params)
+    {
+        return Verdict::Refuse(format!("`{id}`: {e}"));
+    }
+    // A list MailCraft may not change in Outlook takes no change: refused as the command refuses
+    // it, before anything about Outlook is asked (#661).
+    if let Some(text) = read_only_categories(s, id, params) {
+        return Verdict::Refuse(format!("`{id}`: {text}"));
+    }
+    // An explicit batch must never borrow the owner's selection after a malformed target.
+    if BATCH.contains(&id) {
+        if let Err(e) = batch(s, id, params) {
+            return Verdict::Refuse(e);
+        }
+        // (Its flags strictly too; the older one-event Delete reads them as its command does, a
+        // `null` as not said.)
+        if is_batch(s, id, params)
+            && let Err(e) = batch_flags(id, params)
+        {
+            return Verdict::Refuse(format!("`{id}`: {e}"));
+        }
+    }
+    let access = classify(s, id, params);
+    // What else the call needs besides its class (#473); a yes to the question about the class
+    // covers it, since the question names it.
+    let more: Vec<Class> = match access {
+        Access::Owner(c) | Access::Asked(c) => also(s, id, params, c),
+        _ => Vec::new(),
+    };
+    // (The question, whichever class it was asked as, names all of it: a yes covers it all, #566.)
+    let rest = |c: Class| yes.is_some_and(|y| y == c || more.contains(&y)) || more.iter().all(|m| allow.contains(m));
+    match access {
+        Access::Safe => Verdict::Run,
+        Access::Never => Verdict::Refuse(format!("`{id}` isn't available to agents")),
+        Access::Owner(c) if (allow.contains(&c) || yes == Some(c)) && rest(c) => Verdict::Run,
+        Access::Asked(c) if yes == Some(c) => Verdict::Run,
+        Access::Owner(c) | Access::Asked(c) => {
+            // The class allowed already, the question is about what else it needs.
+            let c = match access {
+                Access::Owner(_) if allow.contains(&c) => more.iter().copied().find(|m| !allow.contains(m)).unwrap_or(c),
+                _ => c,
+            };
+            // A question says what it is about, and the yes reaches that alone (`bind`).
+            if bind::object(id).is_none() {
+                return Verdict::Refuse(format!("`{id}` isn't available to agents: what it acts on can't be shown to the owner"));
+            }
+            let what = describe(s, id, params);
+            if what.chars().count() > MAX_QUESTION {
+                return Verdict::Refuse(format!(
+                    "`{id}` is too large to show the owner in a question, and the owner is never asked about what they can't read in full: do it in smaller steps"
+                ));
+            }
+            Verdict::Ask(c, what)
+        }
+    }
+}
+
+/// The most characters of a question about what an agent wants (the window shows all of them;
+/// a call whose description is longer is refused rather than clipped).
+pub const MAX_QUESTION: usize = 900;
+
+/// The refusal when nobody can be asked (headless); `asked`: the owner is asked every time
+/// ([`Access::Asked`]), and no `--allow` covers it.
+pub fn needs_owner(id: &str, class: Class, asked: bool, what: &str) -> String {
+    needs_owner_for(id, &[class], asked, what)
+}
+
+/// [`needs_owner`] for a call that needs more than one class ([`also`]): all of them are named,
+/// so that one start of the server with `--allow` covers it.
+pub fn needs_owner_for(id: &str, classes: &[Class], asked: bool, what: &str) -> String {
+    let why = classes.iter().map(|c| c.what()).collect::<Vec<_>>().join("; ");
+    if asked || classes.iter().any(|c| !Class::ALL.contains(c)) {
+        return format!(
+            "`{id}` needs the owner ({why}): it would {what}. The owner is asked about this in the window every time; no `--allow` lets an agent do it"
+        );
+    }
+    let names = classes.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",");
+    format!(
+        "`{id}` needs the owner ({why}): it would {what}. Only the owner can let an agent do this, by starting the server with `mailcraft-cli mcp --allow {names}`"
+    )
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let clean: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let clean = clean.trim();
+    if clean.chars().count() > n { format!("{}…", clean.chars().take(n).collect::<String>()) } else { clean.to_string() }
+}
+
+fn quoted(s: &str) -> String {
+    let c = clip(s, 80);
+    if c.is_empty() { "(no subject)".to_string() } else { format!("\u{201c}{c}\u{201d}") }
+}
+
+/// `{n} message` / `{n} messages` for `n`, by the language's plural rule.
+// ponytail: always English for now; the session's `interface_language` comes in with the engine's text (slice 4).
+fn plural(n: usize, one: &str, many: &str) -> String {
+    let n = u64::try_from(n).unwrap_or(u64::MAX);
+    mailcraft_i18n::fmt(mailcraft_i18n::Lang::English.tn(n, one, many), &[("n", &n.to_string())])
+}
+
+/// `one` or `many` as a whole sentence for `n` things, by the language's plural rule, with its
+/// `{…}` filled in from `args` (as [`plural`]).
+fn by_count(n: usize, one: &str, many: &str, args: &[(&str, &str)]) -> String {
+    let n = u64::try_from(n).unwrap_or(u64::MAX);
+    mailcraft_i18n::fmt(mailcraft_i18n::Lang::English.tn(n, one, many), args)
+}
+
+fn messages_text(s: &Session, ids: &[Id]) -> String {
+    let subjects: Vec<String> = ids.iter().take(3).filter_map(|id| s.mailbox.message(*id)).map(|m| quoted(&m.subject)).collect();
+    let more = if ids.len() > 3 { ", …" } else { "" };
+    format!("{} ({}{more})", plural(ids.len(), "{n} message", "{n} messages"), subjects.join(", "))
+}
+
+/// `s` with control characters made spaces, in full.
+fn plain(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
+}
+
+/// Up to `n` of `items`, then how many more there are.
+fn some(items: &[String], n: usize) -> String {
+    let more = items.len().saturating_sub(n);
+    let shown = items.iter().take(n).map(|x| plain(x)).collect::<Vec<_>>().join("; ");
+    if more == 0 { shown } else { format!("{shown} and {more} more") }
+}
+
+/// The addresses in a list the way params write them (`a@x; b@y`, or an array).
+fn addresses(v: Option<&Value>) -> Vec<String> {
+    let text = v.map(value_text).unwrap_or_default();
+    text.split([';', ',']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
+}
+
+/// Calendar commands that accept typed batches.
+pub(crate) const BATCH: &[&str] = &["calendar.delete", "calendar.paste"];
+
+/// Whether `id` with `params` is the batch form of the command: a paste is always a batch; a
+/// delete is one unless the command reads it as the older one event
+/// ([`crate::cmd::calendar::delete_form`], the command's own reading): `items`, or no `id` over
+/// the owner's typed selection (the implicit Delete). A payload the command refuses for naming its
+/// target two ways is taken as a batch too, whose reader refuses it, so it is never asked about
+/// as the one appointment in focus. The legacy single `id` (and the focus it stands for) keeps
+/// the question and binding about that one appointment.
+fn is_batch(s: &Session, id: &str, params: &Value) -> bool {
+    match id {
+        "calendar.paste" => true,
+        "calendar.delete" => crate::cmd::calendar::delete_form(&s.sel, params).ok() != Some(crate::cmd::calendar::DeleteForm::One),
+        _ => false,
+    }
+}
+
+/// A batch's targets as its command reads them: a paste's strict concrete `items`, a delete's
+/// deletion set (which also takes a whole series named with `"scope": "series"`). The gate, the
+/// description and the binding all read through here, so none can show or pin a set the command
+/// wouldn't act on.
+fn batch_items(s: &Session, id: &str, params: &Value) -> Result<Vec<crate::SelectedEvent>, String> {
+    if id == "calendar.delete" && is_batch(s, id, params) {
+        return crate::cmd::calendar::delete_items(s, params).map_err(|e| format!("`{id}`: {e}"));
+    }
+    crate::cmd::calendar::selected_items(s, params).map_err(|e| format!("`{id}`: {e}"))
+}
+
+fn batch(s: &Session, id: &str, params: &Value) -> Result<Vec<crate::SelectedEvent>, String> {
+    if id == "calendar.paste" && params.get("items").is_none() {
+        return Err(format!(
+            "`{id}` needs `items`: an agent names the appointments it pastes (1 to {}), and never takes them from what the owner has selected",
+            crate::MAX_SELECTED_EVENTS
+        ));
+    }
+    if id == "calendar.paste" && !p::datetime(params, "start").is_ok_and(|start| start.is_some()) {
+        return Err(format!("`{id}` needs `start` (\"YYYY-MM-DDTHH:MM\"): where the appointments are pasted"));
+    }
+    if let Err(e) = p::id_strict(params, "id") {
+        return Err(format!("`{id}`: {e}"));
+    }
+    // Where a paste would put them is read as `selection::paste` reads it, and must be a calendar
+    // this mailbox has: a malformed destination is refused by the gate exactly as the command
+    // would refuse it, for a copy and a cut alike, never asked about from each item's own.
+    if id == "calendar.paste" {
+        let target = p::id_strict(params, "calendar").map_err(|e| format!("`{id}`: {e}"))?;
+        if let Some(target) = target
+            && s.mailbox.calendar(target).is_none()
+        {
+            return Err(format!("`{id}`: no calendar with id {target}"));
+        }
+    }
+    if id == "calendar.delete" && !is_batch(s, id, params) {
+        return legacy_delete(s, params).map_err(|e| format!("`{id}`: {e}"));
+    }
+    batch_items(s, id, params)
+}
+
+/// The one event the older `calendar.delete` names, read as the command reads it
+/// ([`crate::cmd::calendar::resolve_target`]): the event `id` names, or the one in focus; with
+/// `"scope": "series"` the whole series whatever day `occurrence` names, and a day the series
+/// already skips as the step that does nothing it is. Only a batch is read item by item.
+fn legacy_delete(s: &Session, params: &Value) -> Result<Vec<crate::SelectedEvent>, String> {
+    let named = p::id_strict(params, "id").map_err(|e| e.to_string())?.or(s.sel.event).ok_or("select an appointment first")?;
+    let event = s.mailbox.event(named).ok_or_else(|| format!("no event with id {named}"))?;
+    let target = crate::cmd::calendar::resolve_target(s, event, params).map_err(|e| e.to_string())?;
+    let day = match target.part {
+        crate::cmd::calendar::Part::One(day) => Some(day),
+        crate::cmd::calendar::Part::Series => None,
+    };
+    Ok(vec![crate::SelectedEvent { id: named, day }])
+}
+
+/// The one item the older `calendar.delete` acts on, as [`legacy_delete`] reads it; `None` when the
+/// command would refuse the call.
+fn legacy_item(s: &Session, params: &Value) -> Option<crate::SelectedEvent> {
+    legacy_delete(s, params).ok().and_then(|items| items.first().copied())
+}
+
+fn batch_flags(id: &str, params: &Value) -> Result<(bool, bool), String> {
+    let (one, two) = if id == "calendar.paste" { ("cut", "send") } else { ("decline", "send") };
+    let flag = |key: &str| p::opt_bool(params, key).map_err(|e| e.to_string()).map(|value| value.unwrap_or(false));
+    Ok((flag(one)?, flag(two)?))
+}
+
+fn paste_access(s: &Session, params: &Value) -> Access {
+    let (Ok(items), Ok((cut, sends))) = (batch(s, "calendar.paste", params), batch_flags("calendar.paste", params)) else {
+        return Access::Never;
+    };
+    let access = if sends || pastes_onto_server(s, &items, params) {
+        Access::Owner(Class::Send)
+    } else if cut {
+        Access::Owner(Class::Delete)
+    } else {
+        Access::Safe
+    };
+    match access {
+        // Moving what is open with unsaved changes needs a fresh yes, whatever --allow says.
+        Access::Owner(class) if cut && unsaved(params) => Access::Asked(class),
+        other => other,
+    }
+}
+
+fn pastes_onto_server(s: &Session, items: &[crate::SelectedEvent], params: &Value) -> bool {
+    // (Read strictly, as `batch` and `selection::paste` read it: a destination that isn't an id
+    // never falls back to each item's own calendar.)
+    let target = p::id_strict(params, "calendar").ok().flatten();
+    items.iter().any(|item| {
+        let Some(event) = s.mailbox.event(item.id) else { return false };
+        let destination = target.unwrap_or(event.calendar);
+        let Some(calendar) = s.mailbox.calendar(destination) else { return false };
+        calendar.origin.account != event.origin.account && crate::cmd::calendar::served(s, destination)
+    })
+}
+
+/// The event a calendar call is about: the one `params` creates, or the one it names (or that is
+/// selected), and when it starts.
+fn event_title(s: &Session, id: &str, params: &Value) -> String {
+    if matches!(id, "calendar.new" | "calendar.newMeeting") {
+        let (title, start) = (p::str(params, "title").unwrap_or(""), p::str(params, "start").unwrap_or(""));
+        let at = if start.is_empty() { String::new() } else { format!(" at {}", clip(start, 40)) };
+        return format!("the new event {}{at}", quoted(title));
+    }
+    // An answer to a meeting request in the mail is about the request (#553). Only the commands
+    // that read `message` act on it: the others act on `id`, so their question names that.
+    if matches!(id, "calendar.respond" | "calendar.propose") && params.get("message").is_some() {
+        return match p::id_strict(params, "message").ok().flatten().and_then(|m| s.mailbox.message(m)) {
+            Some(m) => format!("the meeting request {}", quoted(&m.subject)),
+            None => "a meeting request".to_string(),
+        };
+    }
+    match named_event(s, params) {
+        Some(e) => quoted(&e.title),
+        None => "an item of the calendar".to_string(),
+    }
+}
+
+/// The event a call names, or else the selected one, as the command finds it ([`p::id_strict`],
+/// #553): one named wrongly is none, never the selected one.
+fn named_event<'a>(s: &'a Session, params: &Value) -> Option<&'a mailcraft_model::Event> {
+    p::id_strict(params, "id").ok()?.or(s.sel.event).and_then(|e| s.mailbox.event(e))
+}
+
+/// The people a calendar call writes to, read the older way: those its params name and those the
+/// event it is about already has. A delete's set, and what a cut would write, are read by
+/// [`reaches`], which knows which of them a server would actually write to.
+fn invitees(s: &Session, params: &Value) -> Vec<String> {
+    let mut who = addresses(params.get("attendees"));
+    who.extend(addresses(params.get("optional")));
+    if let Some(e) = named_event(s, params) {
+        who.extend(attendee_addresses(e));
+    }
+    unique(who)
+}
+
+/// The addresses of the people an event invites, in the order it lists them.
+fn attendee_addresses(event: &mailcraft_model::Event) -> Vec<String> {
+    event.attendees.iter().map(|attendee| attendee.address.email.trim().to_string()).filter(|email| !email.is_empty()).collect()
+}
+
+/// The addresses as themselves, once, by address.
+fn unique(who: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    who.into_iter().filter(|address| seen.insert(address.trim().to_ascii_lowercase())).collect()
+}
+
+/// Who a calendar command's server mail actually reaches, and what it says to them.
+///
+/// The one reader of a calendar command's recipients: the owner's question ([`batch_text`],
+/// [`delete_text`], [`what_it_does`]) and the binding of their yes ([`bind::Shown`]) both read
+/// it, so a question naming one person and an answer reaching another can't be built.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reaches {
+    /// People a cancellation reaches: those invited to a meeting the owner organizes that an
+    /// account's server keeps, when the delete is to be sent.
+    cancel: Vec<String>,
+    /// How many more it reaches who have no address here (each one on their own).
+    cancel_unnamed: usize,
+    /// People an invitation or an update reaches: a cut into a calendar a server keeps.
+    tell: Vec<String>,
+    /// How many more those reach who have no address here.
+    tell_unnamed: usize,
+    /// Organizers a decline answers: meetings somebody else organizes, when the answer is sent.
+    answer: Vec<String>,
+    /// Meetings whose answer reaches an organizer this mailbox has no address for, by title.
+    unknown: Vec<String>,
+    /// A command that isn't a delete or a paste: the people its own `send` reaches, read the
+    /// older way (kept for those commands).
+    other: Vec<String>,
+}
+
+impl Reaches {
+    /// Everybody the command writes to, in full: the question names the first few, and the yes
+    /// is held to all of them.
+    pub(crate) fn people(&self) -> Vec<String> {
+        let mut who: Vec<String> = Vec::new();
+        for group in [&self.cancel, &self.tell, &self.answer, &self.other] {
+            who.extend(group.iter().cloned());
+        }
+        for title in &self.unknown {
+            who.push(format!("the organizer of {title} (address unknown)"));
+        }
+        // (Somebody without an address is held to by how many there are: the yes is for them too.)
+        if self.cancel_unnamed > 0 {
+            who.push(format!("{} sent a cancellation", nameless_text(self.cancel_unnamed)));
+        }
+        if self.tell_unnamed > 0 {
+            who.push(format!("{} told of the meeting", nameless_text(self.tell_unnamed)));
+        }
+        unique(who)
+    }
+
+    /// What the question adds: who a cancellation or a move reaches, and that a decline answers
+    /// an organizer — named, or named as unknown, never invented and never hidden.
+    fn clauses(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.cancel.is_empty() || self.cancel_unnamed > 0 {
+            out.push(format!("write to {}", people_text(&self.cancel, self.cancel_unnamed)));
+        }
+        if !self.tell.is_empty() || self.tell_unnamed > 0 {
+            out.push(format!("write to {}", people_text(&self.tell, self.tell_unnamed)));
+        }
+        if !self.answer.is_empty() {
+            let to = if self.answer.len() == 1 {
+                format!("its organizer ({})", some(&self.answer, 1))
+            } else {
+                format!("each organizer ({})", some(&self.answer, 8))
+            };
+            out.push(format!("send an answer (a decline) to {to}"));
+        }
+        for title in &self.unknown {
+            out.push(format!("send an answer (a decline) to the organizer of {title}, whose address this mailbox doesn't have"));
+        }
+        if !self.other.is_empty() {
+            out.push(format!("write to {}", people_text(&self.other, 0)));
+        }
+        out
+    }
+}
+
+/// `n people (a; b; …; k people without an address)`, the question naming the first few of
+/// them, and saying how many it can't name.
+fn people_text(who: &[String], unnamed: usize) -> String {
+    let named = match (who.is_empty(), unnamed) {
+        (_, 0) => some(who, 8),
+        (true, _) => nameless_text(unnamed),
+        (false, _) => format!("{}; {}", some(who, 8), nameless_text(unnamed)),
+    };
+    format!("{} ({named})", plural(who.len().saturating_add(unnamed), "{n} person", "{n} people"))
+}
+
+/// `n people without an address`.
+fn nameless_text(n: usize) -> String {
+    plural(n, "{n} person without an address", "{n} people without an address")
+}
+
+/// [`Reaches`] with each address group read once, in the order the mailbox lists it. A meeting
+/// whose organizer is unknown is kept one by one: two of them are two answers, never one.
+fn finished(mut out: Reaches) -> Reaches {
+    out.cancel = unique(out.cancel);
+    out.tell = unique(out.tell);
+    // (The people without an address are counted as they come: two of them are two people.)
+    out.answer = unique(out.answer);
+    out.other = unique(out.other);
+    out
+}
+
+/// What a calendar command would actually have a server send, read as the command reads its
+/// targets: a delete's own typed set or its one `id` (never the selection beside an explicit
+/// `id`), a paste's strict `items`, and the older reading for every other calendar command.
+pub(crate) fn reaches(s: &Session, id: &str, params: &Value) -> Reaches {
+    match id {
+        "calendar.delete" => delete_reaches(s, params),
+        "calendar.paste" => paste_reaches(s, params),
+        _ => finished(Reaches { other: invitees(s, params), ..Default::default() }),
+    }
+}
+
+/// What a `calendar.delete` would send, read as the command reads its targets: the typed set it
+/// deletes ([`batch`]), or the one event an explicit `id` names — the legacy focus is never taken
+/// for an explicit `id`.
+fn delete_reaches(s: &Session, params: &Value) -> Reaches {
+    let mut out = Reaches::default();
+    // Without `send` the command sends nothing, whatever `decline` says.
+    if p::opt_bool(params, "send").ok().flatten() != Some(true) {
+        return out;
+    }
+    let decline = p::opt_bool(params, "decline").ok().flatten().unwrap_or(false);
+    // (The command's own plan of who each item writes to: the set's, or the one event's.)
+    let plan = if is_batch(s, "calendar.delete", params) {
+        // (A set the command would refuse is none: nothing is described from the selection.)
+        if batch(s, "calendar.delete", params).is_err() {
+            return out;
+        }
+        crate::cmd::calendar::delete_notices(s, params).unwrap_or_default()
+    } else {
+        // (The one event as the command reads it: a day of a series it already skips is deleted as
+        // the step that does nothing, which writes to nobody.)
+        legacy_item(s, params)
+            .and_then(|item| {
+                let event = s.mailbox.event(item.id)?;
+                if item.day.is_some_and(|day| event.exceptions.contains(&day)) {
+                    return None;
+                }
+                crate::cmd::calendar::delete_notice(s, event, item, decline)
+            })
+            .into_iter()
+            .collect()
+    };
+    for notice in &plan {
+        reach(s, notice, &mut out);
+    }
+    finished(out)
+}
+
+/// Who one item's mail reaches, by what it says: a cancellation to the people invited to a
+/// meeting the owner organizes; an update or an invitation to those invited; a decline that is
+/// sent to the organizer of somebody else's meeting, or, with no address for them, the meeting's
+/// title, so that two such meetings are two answers.
+fn reach(s: &Session, notice: &crate::cmd::calendar::Notice, out: &mut Reaches) {
+    use crate::cmd::calendar::NoticeKind;
+    match notice.kind {
+        NoticeKind::Cancellation => {
+            out.cancel.extend(notice.to.iter().cloned());
+            out.cancel_unnamed = out.cancel_unnamed.saturating_add(notice.unnamed);
+        }
+        NoticeKind::Update | NoticeKind::Invitation => {
+            out.tell.extend(notice.to.iter().cloned());
+            out.tell_unnamed = out.tell_unnamed.saturating_add(notice.unnamed);
+        }
+        NoticeKind::Decline => match notice.to.first() {
+            Some(email) => out.answer.push(email.clone()),
+            None => out.unknown.push(quoted(s.mailbox.event(notice.item.id).map_or("", |event| event.title.as_str()))),
+        },
+    }
+}
+
+/// What a `calendar.paste` would send, read as `selection::paste` and its own mail summary read
+/// it: a copy is a new appointment with nobody invited, so it writes to nobody; a cut reaches the
+/// people invited to the items whose servers are told.
+fn paste_reaches(s: &Session, params: &Value) -> Reaches {
+    let mut out = Reaches::default();
+    if p::opt_bool(params, "cut").ok().flatten() != Some(true) {
+        return out;
+    }
+    if batch(s, "calendar.paste", params).is_err() {
+        return out;
+    }
+    // (The command's own plan of who each item's move writes to.)
+    for notice in crate::cmd::calendar::paste_notices(s, params).unwrap_or_default() {
+        reach(s, &notice, &mut out);
+    }
+    finished(out)
+}
+
+fn batch_text(s: &Session, id: &str, params: &Value, label: &str) -> String {
+    let Ok(items) = batch(s, id, params) else {
+        return format!(
+            "run \u{201c}{label}\u{201d} ({id}) on a list of calendar items that can't be read as asked: it names no appointment of this mailbox, so nothing of the owner's is meant"
+        );
+    };
+    let cut = id == "calendar.paste" && p::bool(params, "cut") == Some(true);
+    let each: Vec<String> = items.iter().map(|item| item_text(s, item)).collect();
+    let named = match each.as_slice() {
+        [one] => one.clone(),
+        _ => format!("{}: {}", plural(items.len(), "{n} appointment", "{n} appointments"), each.join(", ")),
+    };
+    let placement = if id == "calendar.paste" {
+        let mut destinations = Vec::new();
+        for item in &items {
+            let destination = p::id_strict(params, "calendar").ok().flatten().or_else(|| s.mailbox.event(item.id).map(|event| event.calendar));
+            if let Some(calendar) = destination.and_then(|id| s.mailbox.calendar(id)) {
+                let account = s.mailbox.account(calendar.origin.account).map(|account| account.address().email).filter(|email| !email.is_empty());
+                let where_kept = account.map_or_else(|| "on this computer".to_string(), |email| format!("in account {}", quoted(&email)));
+                let said = format!("calendar {} (id {}, {where_kept})", quoted(&calendar.name), calendar.id);
+                if !destinations.contains(&said) {
+                    destinations.push(said);
+                }
+            }
+        }
+        format!("at {} in {}", quoted(p::str(params, "start").unwrap_or_default()), destinations.join(", "))
+    } else {
+        String::new()
+    };
+    let mut what = match id {
+        "calendar.paste" if cut => format!("move {named} {placement}, out of their calendars"),
+        "calendar.paste" => format!("copy {named} {placement}"),
+        _ => format!("delete {named} from the calendar"),
+    };
+    append_reaches(&mut what, &reaches(s, id, params));
+    what
+}
+
+/// The owner's question about one `calendar.delete` (an explicit `id`, or the legacy focus): the
+/// event, and what the account's server would actually send about it — a cancellation to the
+/// people invited, a decline answered to the organizer, or nothing.
+fn delete_text(s: &Session, params: &Value) -> String {
+    // A series says which of it goes, one day or all of it; anything else is named as it was.
+    let named = match legacy_item(s, params) {
+        Some(item) if s.mailbox.event(item.id).is_some_and(|event| event.recurrence.is_some()) => item_text(s, &item),
+        _ => event_title(s, "calendar.delete", params),
+    };
+    let mut what = format!("delete {named} from the calendar");
+    append_reaches(&mut what, &reaches(s, "calendar.delete", params));
+    what
+}
+
+/// Add what the command would write to the people, as the one recipient reader reads it.
+fn append_reaches(what: &mut String, reaches: &Reaches) {
+    let clauses = reaches.clauses();
+    if !clauses.is_empty() {
+        what.push_str(", and ");
+        what.push_str(&clauses.join("; "));
+    }
+}
+
+/// One appointment of a batch as the owner's question names it. A recurring item that names no
+/// day is the whole series (a batch delete only takes that with `"scope": "series"`); one that
+/// names its own day is that day, whatever the batch-wide scope says.
+fn item_text(s: &Session, item: &crate::SelectedEvent) -> String {
+    let Some(event) = s.mailbox.event(item.id) else { return "an appointment that is gone".to_string() };
+    if event.recurrence.is_some() && item.day.is_none() {
+        return format!("{} (all of its occurrences)", quoted(&event.title));
+    }
+    match item.day {
+        Some(day) => format!("{} on {}", quoted(&event.title), day.iso()),
+        None => format!("{} on {}", quoted(&event.title), event.start.date.iso()),
+    }
+}
+
+/// What a call would do, in a sentence that follows "An agent wants to …" (for the owner's
+/// question; never trusted for anything else).
+pub fn describe(s: &Session, id: &str, params: &Value) -> String {
+    // What the window would lose (`unsaved`) is said in words, never shown as params.
+    let form = matches!(id, "ui.closeDialog" | "ui.dialog" | "ui.closeWindow");
+    let mut bare = params.clone();
+    if !form && let Some(fields) = bare.as_object_mut() {
+        fields.remove("unsaved");
+    }
+    let mut what = what_it_does(s, id, &bare);
+    // A category new on a list kept in step with Outlook, which the call gives an item or a rule
+    // gives mail, is made there too (#661).
+    what.push_str(&made_in_outlook_suffix(s, id, &bare));
+    // Another mailbox in view closes the message the owner is writing (#494); what isn't saved of
+    // it goes to Drafts first, unless it is let go of (`discard`, #470).
+    if matches!(id, "file.new" | "file.open") && owner_writing_any(s) {
+        let unsaved = s.all_composing().any(|c| unsaved_message(s, c));
+        let how = match (unsaved, p::bool(params, "discard") == Some(true)) {
+            (true, true) => " without being saved",
+            (true, false) => "; what isn't saved of it goes to Drafts first",
+            (false, _) => "",
+        };
+        let owners: Vec<&crate::Compose> = s.all_composing().filter(|c| c.owner_changed).collect();
+        match owners.as_slice() {
+            [one] => what.push_str(&format!("; the message {} that the owner is writing is closed{how}", writing(s, &json!({"compose": one.id})))),
+            many => what.push_str(&format!("; the {} messages the owner is writing are closed{how}", many.len())),
+        }
+    }
+    // And the windows of appointments with changes that aren't saved, as does taking the
+    // appointments away.
+    if !form && unsaved(params) {
+        let (item, many) = unsaved_item(params);
+        let (are, them) = if many { ("are", "them") } else { ("is", "it") };
+        what.push_str(&format!("; {item} {are} closed without saving the changes made in {them}"));
+    }
+    what
+}
+
+fn what_it_does(s: &Session, id: &str, params: &Value) -> String {
+    let label = s.registry.get(id).map(|c| c.label).unwrap_or(id);
+    let st = |k: &str| p::str(params, k).unwrap_or("");
+    match id {
+        "keys.import" => {
+            let to = match p::str(params, "address") {
+                Some(a) => format!("for {}", quoted(&clip(a, 80))),
+                None => "for every address the keys name".to_string(),
+            };
+            // What the file holds, read as the import would read it (the addresses come from the
+            // keys: data, never instructions).
+            let what = match crate::cmd::keys::preview(s, params) {
+                Some(found) if !found.is_empty() => {
+                    let named: Vec<String> = found
+                        .iter()
+                        .map(|(address, format, fingerprint)| {
+                            let fp = crate::digital_signature::fingerprint_digits(fingerprint);
+                            let tail = fp.get(fp.len().saturating_sub(16)..).unwrap_or(&fp);
+                            format!("{} ({format} key …{tail})", quoted(&clip(address, 80)))
+                        })
+                        .collect();
+                    format!(" ({})", some(&named, 3))
+                }
+                Some(_) => " (none of its keys is for an address)".to_string(),
+                None => String::new(),
+            };
+            format!(
+                "import Public keys from a file {to}{what}: Digital signatures from those addresses are then checked with them (they are never marked Verified)"
+            )
+        }
+        "keys.remove" => {
+            let wanted = crate::digital_signature::fingerprint_digits(st("fingerprint"));
+            let address = st("address").trim().to_lowercase();
+            let verified = !wanted.is_empty()
+                && s.mailbox
+                    .public_keys
+                    .of(&address)
+                    .iter()
+                    .any(|k| k.verified && crate::digital_signature::fingerprint_digits(&k.fingerprint) == wanted);
+            let marked = if verified { " (you marked it Verified)" } else { "" };
+            format!("remove the Public key {} kept for {}{marked}", quoted(&clip(st("fingerprint"), 100)), quoted(&clip(st("address"), 80)))
+        }
+        "compose.send" => match s.compose_named(params) {
+            Some(c) => {
+                let to: Vec<String> =
+                    [c.to.as_str(), c.cc.as_str(), c.bcc.as_str()].into_iter().flat_map(|l| addresses(Some(&Value::String(l.to_string())))).collect();
+                let to = if to.is_empty() { "nobody yet".to_string() } else { some(&to, 12) };
+                let files = if c.attachments.is_empty() {
+                    String::new()
+                } else {
+                    let names: Vec<String> = c.attachments.iter().take(5).map(|a| clip(&a.name, 40)).collect();
+                    format!(" with {} ({})", plural(c.attachments.len(), "{n} attachment", "{n} attachments"), names.join(", "))
+                };
+                // From a sender address other than the account's own, said (#797).
+                let from = if c.from.is_empty() { String::new() } else { format!(" from {}", plain(&c.from)) };
+                format!("send {}{from} to {to}{files}", quoted(&c.subject))
+            }
+            None => "send the message being written".to_string(),
+        },
+        // Not before a time (#950): said in the owner's zone, as what it sends is said as Send says it.
+        "compose.sendLater" => {
+            let when = p::i64(params, "at")
+                .map(|at| s.wall_at(at))
+                .map_or_else(|| "a time not given".to_string(), |w| format!("{} {:02}:{:02}", w.date.iso(), w.hour, w.minute));
+            match s.compose_named(params) {
+                Some(c) => {
+                    let to: Vec<String> = [c.to.as_str(), c.cc.as_str(), c.bcc.as_str()]
+                        .into_iter()
+                        .flat_map(|l| addresses(Some(&Value::String(l.to_string()))))
+                        .collect();
+                    let to = if to.is_empty() { "nobody yet".to_string() } else { some(&to, 12) };
+                    format!("send {} to {to}, not before {when}", quoted(&c.subject))
+                }
+                None => format!("send the message being written, not before {when}"),
+            }
+        }
+        "mail.react" => {
+            let emoji = crate::cmd::react::canonical(st("emoji")).unwrap_or("an emoji");
+            format!("send {emoji} as a reaction to the sender of {}", messages_text(s, &taken(params)))
+        }
+        "mail.setSendTime" => {
+            let when = match params.get("at") {
+                Some(Value::Null) => "the next Send/Receive".to_string(),
+                _ => p::i64(params, "at")
+                    .map(|at| s.wall_at(at))
+                    .map_or_else(|| "a time not given".to_string(), |w| format!("{} {:02}:{:02}", w.date.iso(), w.hour, w.minute)),
+            };
+            let ids = taken(params);
+            format!("let {} go not before {when}", messages_text(s, &ids))
+        }
+        "mail.move" | "mail.copy" => {
+            // What the agent names (#620), read as the command reads them (#503, #451).
+            let ids = taken(params);
+            let verb = if id == "mail.move" { "move" } else { "copy" };
+            let account = |id| s.mailbox.account(id).map_or_else(|| "another account".to_string(), |a| clip(&a.email, 80));
+            match p::id(params, "folder").and_then(|f| s.mailbox.folder(f)) {
+                Some(f) if !is_outbox(&s.mailbox, f.id) => {
+                    format!("{verb} {} onto the server of {}, into {}", messages_text(s, &ids), account(f.account), quoted(&f.name))
+                }
+                // An IMAP account's holds what is put there (#607), and so does a JMAP account's
+                // what is moved there (#1074).
+                Some(f) if s.mailbox.holds_what_is_moved_in(f.id) => {
+                    format!("{verb} {} into the Outbox of {}, held there unsent until Send Again", messages_text(s, &ids), account(f.account))
+                }
+                _ => format!("put {} in the Outbox, which sends them", messages_text(s, &ids)),
+            }
+        }
+        // (Never into the Outbox itself: `import` puts mail elsewhere, or refuses it.)
+        "file.import" => "import a file with an Outbox chosen: no mail goes in it, and none is sent".to_string(),
+        "mail.delete" | "mail.deletePermanently" => {
+            let ids = taken(params);
+            format!("permanently delete {}", messages_text(s, &ids))
+        }
+        "folder.empty" | "folder.delete" => {
+            let f = p::id_strict(params, "id").map(|f| f.unwrap_or(s.view.folder)).unwrap_or_default();
+            let name = s.mailbox.folder(f).map(|f| quoted(&f.name)).unwrap_or_else(|| "a folder".to_string());
+            // Every message that goes with it, those in the folders under it too.
+            let n = if id == "folder.empty" { crate::cmd::folder::emptied(s, f).len() } else { crate::cmd::folder::deleted_with(s, f).len() };
+            let verb = if id == "folder.empty" { "permanently empty" } else { "permanently delete the folder" };
+            format!("{verb} {name} and the {} in it", plural(n, "{n} message", "{n} messages"))
+        }
+        // (#1401) Counted now: a different count on the yes is another question.
+        "mail.removeImportedDuplicates" => {
+            let folder = p::id_strict(params, "folder").ok().flatten();
+            let n = crate::cmd::imported_dupes::twins(&s.mailbox, folder).remove.len();
+            let where_ = folder.and_then(|f| s.mailbox.folder(f)).map_or_else(|| "every folder".to_string(), |f| quoted(&f.name));
+            format!(
+                "remove {} that only this computer has, beside the same mail from its server in {where_} (the server's copies are not touched, and nothing is sent)",
+                plural(n, "{n} message", "{n} messages")
+            )
+        }
+        "account.setAutomaticReplies" => {
+            let account = p::id(params, "account")
+                .and_then(|a| s.mailbox.account(a))
+                .map_or_else(|| "the first Microsoft account".to_string(), |a| clip(&a.email, 80));
+            match st("status") {
+                "disabled" => format!("turn off the automatic replies of {account}"),
+                status => {
+                    let when =
+                        if status == "scheduled" { format!(" from {} to {}", clip(st("start"), 20), clip(st("end"), 20)) } else { String::new() };
+                    let reply = |k: &str| p::str(params, k).map(|t| format!(", {k}: {}", quoted(&clip(t, 200)))).unwrap_or_default();
+                    format!("have the server of {account} answer mail on the owner's behalf{when}{}{}", reply("internal"), reply("external"))
+                }
+            }
+        }
+        "calendar.forward" => format!("forward {} to {}", event_title(s, id, params), some(&addresses(params.get("to")), 12)),
+        "calendar.propose" => format!("propose another time for {} to its organizer", event_title(s, id, params)),
+        "calendar.respond" => format!("answer {} ({}) and tell its organizer", event_title(s, id, params), clip(st("response"), 20)),
+        "mail.unsubscribe" | "ui.unsubscribe" => {
+            // Each by the key its command reads: what is approved is what is done.
+            let key = if id == "ui.unsubscribe" { "message" } else { "id" };
+            let from = p::id(params, key).or_else(|| if id == "ui.unsubscribe" { s.sel.focus() } else { s.sel.messages.last().copied() });
+            let sender = from.and_then(|m| s.mailbox.message(m)).map_or_else(|| "the selected message".to_string(), |m| clip(&m.from.email, 80));
+            // By mail, where it is written and what it says go into the question (#1207).
+            match from.and_then(|m| unsubscribe_mail(s, m)) {
+                Some(mail) => format!("unsubscribe from the mail of {sender} by writing {mail}"),
+                None => format!("unsubscribe from the mail of {sender}, which reaches the list by its server"),
+            }
+        }
+        "mail.unsubscribeMany" | "ui.unsubscribeMany" => {
+            let named = taken(params);
+            let ids = if named.is_empty() { s.sel.messages.clone() } else { named };
+            // Only `ui.unsubscribeMany` writes, and only to the requests by mail it names (`mail`),
+            // read as it reads them: each named is shown, or the call is refused (at most 20).
+            let mails: Vec<String> = taken(&json!({"ids": params.get("mail")})).into_iter().filter_map(|m| unsubscribe_mail(s, m)).collect();
+            let writes =
+                if id == "ui.unsubscribeMany" && !mails.is_empty() { format!(", and writing {}", some(&mails, mails.len())) } else { String::new() };
+            format!("unsubscribe from the lists of {} by their servers{writes}", messages_text(s, &ids))
+        }
+        _ if BATCH.contains(&id) && is_batch(s, id, params) => batch_text(s, id, params, label),
+        _ if id == "calendar.delete" => delete_text(s, params),
+        _ if id.starts_with("calendar.") && p::bool(params, "send") == Some(true) => {
+            let who = reaches(s, id, params).people();
+            let to = if who.is_empty() {
+                "the people it has invited".to_string()
+            } else {
+                format!("{} ({})", plural(who.len(), "{n} person", "{n} people"), some(&who, 8))
+            };
+            format!("{label}: {}, and write to {to}", event_title(s, id, params))
+        }
+        "ui.eventWindow" => {
+            let who = addresses(params.get("attendees"));
+            let to = if who.is_empty() {
+                "nobody (no one is invited)".to_string()
+            } else {
+                format!("{} ({})", plural(who.len(), "{n} person", "{n} people"), some(&who, 8))
+            };
+            format!("{} the appointment or meeting in its window, which can make the account's server write to {to}", clip(st("do"), 20))
+        }
+        "people.delete" => {
+            let c = p::id_strict(params, "id").ok().and_then(|c| c.or(s.sel.contact)).and_then(|c| s.mailbox.contact(c));
+            format!(
+                "permanently delete the contact {}; contacts don't go to Deleted Items",
+                c.map(|c| quoted(&c.name())).unwrap_or_else(|| "(none selected)".to_string())
+            )
+        }
+        "people.merge" => {
+            let name = |c: Option<u64>| c.and_then(|c| s.mailbox.contact(c)).map(|c| quoted(&c.name())).unwrap_or_else(|| "(none)".to_string());
+            let others: Vec<String> =
+                params.get("others").and_then(Value::as_array).into_iter().flatten().take(100).map(|o| name(o.as_u64())).collect();
+            format!(
+                "merge {} into the contact {} and permanently delete them; contacts don't go to Deleted Items",
+                if others.is_empty() {
+                    "(no contacts)".to_string()
+                } else {
+                    format!("{} ({})", plural(others.len(), "{n} contact", "{n} contacts"), some(&others, 8))
+                },
+                name(p::id(params, "keep"))
+            )
+        }
+        "tasks.new" | "tasks.fromMessage" if new_task_onto(s, id, params).is_some() => {
+            let account = new_task_onto(s, id, params).and_then(|a| s.mailbox.account(a));
+            format!("put a task in the To Do of {}", account.map(|a| a.email.trim().to_string()).unwrap_or_else(|| "an account".to_string()))
+        }
+        "tasks.delete" => {
+            let t = p::id_strict(params, "id").ok().and_then(|t| t.or(s.sel.task)).and_then(|t| s.mailbox.task(t));
+            let shared = if shared_task(s, id, params).is_some() { SHARED_TASK } else { "" };
+            format!("permanently delete the task {}{shared}", t.map(|t| quoted(&t.title)).unwrap_or_else(|| "(none selected)".to_string()))
+        }
+        "tasks.edit" | "tasks.complete" | "tasks.categorize" if shared_task(s, id, params).is_some() => {
+            let t = shared_task(s, id, params).map(|t| quoted(&t.title)).unwrap_or_default();
+            // (A name new on a list kept in step with Outlook is made there too, #661.)
+            // (For `tasks.edit`, said after it as for any to-do it changes.)
+            let made = match makes_in_outlook(s, id, params).filter(|_| id != "tasks.edit") {
+                Some(m) => format!(
+                    "; the category {} is new on the list, which is kept in step with Outlook, and is made in Outlook too",
+                    m.names.iter().map(|n| quoted(n)).next().unwrap_or_default()
+                ),
+                None => String::new(),
+            };
+            format!("{} on the task {t}{SHARED_TASK}{made}", run_text(label, id, params))
+        }
+        "category.set" | "mail.categorize" | "tasks.categorize" | "people.categorize" | "calendar.categorize"
+            if makes_in_outlook(s, id, params).is_some() =>
+        {
+            made_in_outlook_text(s, id, params)
+        }
+        "category.remove" => {
+            let shared = if shared_category(s, id, params) { SHARED_CATEGORY } else { "" };
+            let owner = p::id(params, "account").and_then(|a| s.mailbox.category_list_owner(a));
+            let whose = owner.and_then(|a| s.mailbox.account(a)).map(|a| format!(" of {}", quoted(&a.email))).unwrap_or_default();
+            // A list kept in step with its server: the category goes from Outlook too (#661), as
+            // the call is classed.
+            let outlook = removes_in_outlook(s, params);
+            let there = if outlook { " and from Outlook" } else { "" };
+            format!("delete the category {}{whose}{there}, taking it off everything that has it{shared}", quoted(st("name")))
+        }
+        // (A category the rules beside it then make in Outlook is said after it, #661.)
+        "view.timeZone"
+            if zone_changes(s, id, params) && (!reads_beside_said(s, 0, reads_days, "").is_empty() || makes_in_outlook(s, id, params).is_some()) =>
+        {
+            let zone = crate::cmd::zones::rule_zone_after(s, params).map(|z| z.id().to_string()).unwrap_or_default();
+            let beside = match reads_beside_said(s, 0, reads_days, "the days mail came by the calendar's time zone") {
+                // Beside a rule that makes a category in Outlook alone (said after it, #661): why.
+                none if none.is_empty() => "; a rule reads the days mail came by it".to_string(),
+                beside => beside,
+            };
+            // (And the second zone, which no rule reads, as it is given.)
+            let second = match params.get("second") {
+                Some(Value::String(z)) if !z.trim().is_empty() => format!(", with the second time zone {}", quoted(&clip(z, 60))),
+                Some(_) => ", with no second time zone".to_string(),
+                None => String::new(),
+            };
+            format!("show the calendar in the time zone {}{second}{beside}", quoted(&zone))
+        }
+        "category.rename"
+            if shared_category(s, id, params)
+                || renames_in_outlook(s, params)
+                || !rename_beside_said(s, params).is_empty()
+                || makes_in_outlook(s, id, params).is_some() =>
+        {
+            // In Outlook too (#661): the new name is made there, the items there take it (those
+            // that aren't kept on this computer too, #851), and the old one is deleted there.
+            // Whose Outlook, as `category.remove` says: two accounts may both have the name.
+            let outlook = renames_in_outlook(s, params);
+            let owner = p::id(params, "account").and_then(|a| s.mailbox.category_list_owner(a));
+            let whose = owner.filter(|_| outlook).and_then(|a| s.mailbox.account(a)).map(|a| format!(" of {}", quoted(&a.email))).unwrap_or_default();
+            // (Other letters alone: the mail and events that aren't kept here keep the old spelling.)
+            // (Compared as the rename itself compares them: the new name cleaned and cut to size.)
+            let letters = mailcraft_model::clean_name(st("to")).is_some_and(|to| mailcraft_model::sync::same_category(st("from").trim(), &to));
+            let there = if outlook && letters {
+                " in Outlook too: the new spelling is made there, and the old one is deleted there"
+            } else if outlook {
+                " in Outlook too: the new name is made there, the mail and events there that have the old one get it, and the old one is deleted there"
+            } else {
+                ""
+            };
+            let shared = if shared_category(s, id, params) { SHARED_CATEGORY } else { "" };
+            // (And the rules for the same mail it rewrites beside a rule that files mail onto
+            // another server, #566.)
+            format!("rename the category {}{whose} to {}{there}{shared}{}", quoted(st("from")), quoted(st("to")), rename_beside_said(s, params))
+        }
+        "category.addToOutlook" => {
+            // Whose Outlook it goes to: a shared mailbox's list is its owner's.
+            let owner = p::id(params, "account").and_then(|a| s.mailbox.category_list_owner(a));
+            let whose = owner.and_then(|a| s.mailbox.account(a)).map(|a| format!(" of {}", quoted(&a.email))).unwrap_or_default();
+            format!("send the category {}{whose}, kept on this computer only, to Outlook, where it is kept in step from then on", quoted(st("name")))
+        }
+        _ if leaves(id) => leaving_text(s, params),
+        _ if let Some(text) = starting_text(s, id, params) => text,
+        "ui.closeDialog" | "ui.dialog" => form_text(id, params),
+        "ui.closeWindow" if params.get("unsaved").is_some_and(|v| !v.is_null()) => form_text(id, params),
+        "compose.discard" if owner_writing(s, params) => {
+            format!("throw away the message {} that the owner is writing, and its draft in Drafts, if it has one", writing(s, params))
+        }
+        "edit.undo" | "edit.redo" => {
+            let redo = id == "edit.redo";
+            let label = if redo { s.redo_label() } else { s.undo_label() };
+            let verb = if redo { "redo" } else { "undo" };
+            // Everything the step does that is asked about, in one sentence (#473): what it puts
+            // back, the messages it takes away, the drafts, and the categories it has deleted in
+            // Outlook (#661).
+            let drafts = s.undo_drafts(redo);
+            let others: Vec<Id> = s.undo_taken(redo).into_iter().filter(|m| !drafts.contains(m)).collect();
+            // A name it deletes in several accounts is named once.
+            let mut names: Vec<String> = Vec::new();
+            for name in s.undo_deletes_categories(redo) {
+                if !names.iter().any(|n| mailcraft_model::sync::same_category(n, &name)) {
+                    names.push(name);
+                }
+            }
+            let names: Vec<String> = names.iter().map(|n| quoted(n)).collect();
+            // (Each of these works the undo out on a copy of the mailbox: once.)
+            let (places, (rule_names, rule_onto)) = (s.undo_places(redo), s.undo_rules_onto_named(redo));
+            let reverts = s.undo_reverts_with(redo, || !places.is_empty() || !rule_onto.is_empty());
+            let what = match reverts {
+                Some(Class::Accounts) => Some("the accounts"),
+                // What a step that lets more mail reach a rule onto another server puts back is
+                // said below (#566), and so are the categories it sends to Outlook (#661).
+                Some(Class::Send) if !s.undo_sends_items(redo) => None,
+                Some(Class::Send) => Some(SENT_ITEMS),
+                // What Delete is for is said below.
+                Some(Class::Delete) => None,
+                _ => Some(SETTINGS_PUT_BACK),
+            };
+            let mut does: Vec<String> = what.map(|w| format!("puts {w} back as they were")).into_iter().collect();
+            // What else a yes to the accounts covers (#661): a change that writes to people.
+            if reverts == Some(Class::Accounts) && s.undo_sends_items(redo) {
+                does.push(format!("puts {SENT_ITEMS} back as they were"));
+            }
+            // The rules and the like it puts back when it is asked about for something else
+            // (#661), and the categories those rules give mail and have made in Outlook.
+            let rules_made = gathered(s.undo_rules_make_categories(redo)).map(|m| made_suffix(s, &m, true)).unwrap_or_default();
+            let with_settings = !matches!(reverts, None | Some(Class::Settings)) && s.undo_changes_settings(redo);
+            if with_settings {
+                does.push(format!("puts {SETTINGS_PUT_BACK} back as they were{rules_made}"));
+            } else if !rules_made.is_empty() && rule_onto.is_empty() {
+                // What it puts back beside the rules (#566), when it isn't said with the settings
+                // above: an account or its address, which may let other mail reach them, or a list
+                // of categories.
+                let step = if redo { s.redo.last() } else { s.history.last() };
+                if step.is_some_and(|step| !changed_accounts(&s.mailbox, &step.mailbox).is_empty()) {
+                    does.push(format!("may let other new mail reach the rules{rules_made}"));
+                } else {
+                    does.push(format!("puts the categories back as they were{rules_made}"));
+                }
+            }
+            if !places.is_empty() {
+                // Send for a message (#566): it waits again to be made on another account's server.
+                does.push(format!("puts mail back on its way onto the server of {}", servers_named(s, &places)));
+            }
+            if !rule_onto.is_empty() {
+                // Send for the rules (#566): one that files mail onto another server is on after it,
+                // and more mail may reach it (the rules, the Safe or Blocked Senders or an address
+                // they read changed back).
+                let more = rule_names.len().saturating_sub(5);
+                let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+                let server = servers_named(s, &rule_onto);
+                does.push(by_count(
+                    rule_names.len(),
+                    "may let more new mail reach the rule {names}{more}, which files mail onto the server of {server}",
+                    "may let more new mail reach the rules {names}{more}, which file mail onto the server of {server}",
+                    &[("names", &rule_names.iter().take(5).cloned().collect::<Vec<_>>().join(", ")), ("more", &more), ("server", &server)],
+                ));
+                // (And the categories the rules give mail and have made in Outlook, said once.)
+                if !with_settings && let Some(last) = does.last_mut() {
+                    last.push_str(&rules_made);
+                }
+            }
+            // The categories it deletes in Outlook are named below, and not said twice (#661).
+            if s.undo_removes_more_than_outlooks(redo) {
+                // Gone for good: they don't go to Deleted Items.
+                does.push("takes away contacts, events, tasks, calendars or categories made since, for good".to_string());
+            }
+            if !others.is_empty() {
+                does.push(format!("takes away {}", messages_text(s, &others)));
+            }
+            if !drafts.is_empty() {
+                let subject = drafts.first().and_then(|d| s.mailbox.message(*d)).map(|m| m.subject.as_str()).filter(|t| !t.trim().is_empty());
+                let which = match (drafts.len(), subject) {
+                    (1, Some(t)) => format!("the draft {}", quoted(t)),
+                    (1, None) => "a draft".to_string(),
+                    (n, _) => format!("{n} drafts"),
+                };
+                does.push(format!("takes away {which} in Drafts or puts back an earlier version, and anything written in it since may be lost"));
+            }
+            match names.as_slice() {
+                [] => {}
+                [one] => does.push(format!("deletes the category {one} in Outlook")),
+                many => does.push(format!("deletes the categories {} in Outlook", some(many, 3))),
+            }
+            // What it makes in Outlook again, or gives another colour there (#661).
+            let (made, colored): (Vec<(String, bool)>, Vec<(String, bool)>) = s.undo_makes_categories(redo).into_iter().partition(|(_, made)| *made);
+            let made: Vec<String> = made.iter().map(|(n, _)| quoted(n)).collect();
+            match made.as_slice() {
+                [] => {}
+                [one] => does.push(format!("makes the category {one} in Outlook")),
+                many => does.push(format!("makes the categories {} in Outlook", some(many, 3))),
+            }
+            // A rename taken back after it reached Outlook: the mail and events there that were
+            // given the one name get the other again (#851).
+            for (owner, from, to) in s.undo_renames_on_server(redo).iter().take(3) {
+                // (Whose Outlook, as the question for the rename says: two accounts may have the name.)
+                let whose = s.mailbox.account(*owner).map(|a| format!(" of {}", quoted(&a.email))).unwrap_or_default();
+                does.push(format!("gives the mail and events in Outlook{whose} that have the category {} the name {}", quoted(from), quoted(to)));
+            }
+            let colored: Vec<String> = colored.iter().map(|(n, _)| quoted(n)).collect();
+            match colored.as_slice() {
+                [] => {}
+                [one] => does.push(format!("gives the category {one} another colour in Outlook")),
+                many => does.push(format!("gives the categories {} another colour in Outlook", some(many, 3))),
+            }
+            let sent: Vec<String> = s.undo_sends_categories(redo).iter().map(|n| quoted(n)).collect();
+            match sent.as_slice() {
+                [] => {}
+                [one] => does.push(format!("sends the category {one}, kept on this computer only, to Outlook")),
+                many => does.push(format!("sends the categories {}, kept on this computer only, to Outlook", some(many, 3))),
+            }
+            if does.is_empty() {
+                does.push(format!("puts {SETTINGS_PUT_BACK} back as they were"));
+            }
+            format!("{verb} {}, which also {}", quoted(label.unwrap_or("the last change")), does.join("; it also "))
+        }
+        // Each with the rules switched on that put mail onto another server which the change
+        // reaches ([`beside_onto_server`]).
+        "rules.add" => {
+            let beside = crate::cmd::rules::rule_from_params(s, params).map(|r| beside_said(s, r.account, 0, true));
+            format!("{}{}", rule_text(s, params), beside.unwrap_or_default())
+        }
+        "rules.fromMessage" => match crate::cmd::rules::rule_from_message(s, params) {
+            Ok((r, _)) => {
+                let beside = beside_said(s, r.account, 0, true);
+                let folder = r.actions.iter().find_map(|a| if let mailcraft_model::Action::MoveTo(f) = a { Some(*f) } else { None });
+                let to = folder.map(|f| quoted(&s.mailbox.folder_path(f))).unwrap_or_else(|| "a folder".to_string());
+                let from = r.conditions.iter().find_map(|c| match c {
+                    mailcraft_model::Condition::From(p) | mailcraft_model::Condition::FromContains(p) => p.first().map(|t| plain(t)),
+                    _ => None,
+                });
+                let from = quoted(&from.unwrap_or_default());
+                let onto = rule_onto_server(s, &r, one_account(&r)).and_then(|a| s.mailbox.account(a));
+                // (One kept here says whose mail it is for, as the question about any rule made does.)
+                let here = r.keep != mailcraft_model::Keep::Server;
+                let whose = if here { whose(s, r.account) } else { String::new() };
+                let made = match onto {
+                    Some(a) => format!("make a rule{whose} that always moves mail from {from} onto the server of {}, into {to}", clip(&a.email, 80)),
+                    None => format!("make a rule{whose} that always moves mail from {from} to {to}"),
+                };
+                match s.mailbox.account(r.account).filter(|_| !here) {
+                    Some(a) => {
+                        format!("{made}, kept on the server of {} where it runs whether MailCraft is open or not{beside}", quoted(&plain(&a.email)))
+                    }
+                    None => format!("{made}{beside}"),
+                }
+            }
+            Err(_) => "make a rule from a message that can't be made as asked".to_string(),
+        },
+        // Named whatever it is asked as: the folder, its account and the rules (#566).
+        "rules.run" => {
+            // (Named wrongly, the command refuses it: not the folder in view or every rule.)
+            let (Ok(folder), Ok(only)) = (p::id_strict(params, "folder"), p::id_strict(params, "id")) else {
+                return "run the rules on a folder or a rule named in a way that can't be read".to_string();
+            };
+            let folder = folder.unwrap_or(s.view.folder);
+            let from = s.mailbox.folder(folder).map(|f| f.account);
+            let running: Vec<&mailcraft_model::Rule> =
+                s.mailbox.rules.iter().filter(|r| r.enabled && from.is_some_and(|a| r.is_for(a)) && only.is_none_or(|o| o == r.id)).collect();
+            // The accounts whose servers the run moves mail onto, and those it copies mail onto,
+            // each once.
+            let (mut moves, mut copies): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+            for a in running.iter().flat_map(|r| &r.actions) {
+                let (list, f) = match a {
+                    mailcraft_model::Action::MoveTo(f) => (&mut moves, f),
+                    mailcraft_model::Action::CopyTo(f) => (&mut copies, f),
+                    _ => continue,
+                };
+                if let Some(email) = folder_onto_server(s, *f, from).and_then(|a| s.mailbox.account(a)).map(|a| clip(&a.email, 80))
+                    && !list.contains(&email)
+                {
+                    list.push(email);
+                }
+            }
+            // (One rule named, or the rules: "which moves", "which move".)
+            let one = only.is_some_and(|o| s.mailbox.rules.iter().any(|r| r.id == o));
+            let verbs = if one { ("moves", "copies") } else { ("move", "copy") };
+            let onto: Vec<String> = [(verbs.0, moves), (verbs.1, copies)]
+                .into_iter()
+                .filter(|(_, to)| !to.is_empty())
+                .map(|(verb, to)| format!("{verb} mail onto the server of {}", to.join(", ")))
+                .collect();
+            // The folder by its account too: every account has an Inbox.
+            let place = s.mailbox.folder(folder).map_or_else(
+                || "a folder".to_string(),
+                |f| match s.mailbox.account(f.account) {
+                    Some(a) if !a.email.is_empty() => format!("{} of {}", quoted(&s.mailbox.folder_path(f.id)), clip(&a.email, 80)),
+                    // (An account with no address by its name, as the Rules dialog shows it.)
+                    Some(a) if !a.name.trim().is_empty() => format!("{} of {}", quoted(&s.mailbox.folder_path(f.id)), quoted(&clip(&a.name, 80))),
+                    _ => quoted(&s.mailbox.folder_path(f.id)),
+                },
+            );
+            let what = match only.and_then(|o| s.mailbox.rules.iter().find(|r| r.id == o)) {
+                Some(r) => format!("the rule {}", quoted(&r.name)),
+                None => "the rules".to_string(),
+            };
+            let mut text = format!("run {what} on {place}");
+            if !onto.is_empty() {
+                text.push_str(&format!(", which {}", onto.join(" and ")));
+            }
+            text
+        }
+        "rules.move" => {
+            let r = p::id(params, "id").and_then(|r| s.mailbox.rules.iter().find(|r2| r2.id == r));
+            let way = if p::str(params, "direction") == Some("down") { "down" } else { "up" };
+            match r {
+                Some(r) => format!(
+                    "move the rule {}{} {way}, which changes which rules run first{}",
+                    quoted(&r.name),
+                    whose(s, r.account),
+                    beside_said(s, r.account, r.id, true)
+                ),
+                None => "move a rule that isn't there".to_string(),
+            }
+        }
+        "rules.keepOnServer" => {
+            let r = p::id(params, "id").and_then(|r| s.mailbox.rules.iter().find(|r2| r2.id == r));
+            // As the rule will be: that account's ([`kept_on_server`]), with the rules beside it
+            // that keeping it reaches ([`kept_reach`]).
+            // One the command refuses changes nothing beside it.
+            let kept = kept_reach(s, params);
+            let beside = kept.as_ref().map(|(r, account, on)| beside_said(s, *account, r.id, *on)).unwrap_or_default();
+            let r = kept.as_ref().map(|(r, _, _)| r).or(r);
+            let account = p::id(params, "account").or(r.map(|r| r.account)).and_then(|a| s.mailbox.account(a));
+            let to = account.map(|a| quoted(&plain(&a.email))).unwrap_or_else(|| "a Microsoft account".to_string());
+            match r {
+                Some(r) => format!(
+                    "keep the rule {} on the server of {to}, where it runs whether MailCraft is open or not: {}{}",
+                    quoted(&r.name),
+                    rule_words(s, r),
+                    beside
+                ),
+                None => "keep a rule that isn't there on a server".to_string(),
+            }
+        }
+        "rules.enable" | "rules.remove" => {
+            let r = p::id(params, "id").and_then(|r| s.mailbox.rules.iter().find(|r2| r2.id == r));
+            // Read as the command reads it, which refuses a `value` that isn't one.
+            // (`on`: whether the rule is on after it, as the gate reads it; none for a `value` that
+            // the command refuses.)
+            let (verb, on) = match (r, p::opt_bool(params, "value")) {
+                _ if id == "rules.remove" => ("delete", Some(false)),
+                (Some(r), Ok(on)) if on.unwrap_or(!r.enabled) => ("switch on", Some(true)),
+                (Some(_), Ok(_)) => ("switch off", Some(false)),
+                _ => ("switch on or off", None),
+            };
+            match r {
+                Some(r) => {
+                    // A rule the server has, or may have (sent with no answer yet), changes there too.
+                    let there = s
+                        .mailbox
+                        .account(r.account)
+                        .filter(|_| r.on_server() || r.unanswered)
+                        .map(|a| format!(", on the server of {} too", quoted(&plain(&a.email))))
+                        // One kept here: whose mail it is for, as the question about making it says.
+                        .unwrap_or_else(|| whose(s, r.account));
+                    let beside = on.map(|on| beside_said(s, r.account, r.id, on)).unwrap_or_default();
+                    format!("{verb} the rule {}{there}: {}{beside}", quoted(&r.name), rule_words(s, r))
+                }
+                None => format!("{verb} a rule that isn't there"),
+            }
+        }
+        "junk.blockSender" | "junk.neverBlockSender" | "junk.neverBlockDomain" => {
+            let ids = p::ids_strict(params).map(|m| m.unwrap_or_else(|| s.sel.messages.clone())).unwrap_or_default();
+            let domain = id == "junk.neverBlockDomain";
+            let mut who: Vec<String> = Vec::new();
+            for m in ids.iter().filter_map(|m| s.mailbox.message(*m)) {
+                let address = m.from.email.trim();
+                let entry = if domain { address.rsplit_once('@').map(|(_, d)| format!("@{d}")) } else { Some(address.to_string()) };
+                if let Some(e) = entry.as_deref().and_then(mailcraft_model::junk_entry)
+                    && !who.contains(&e)
+                {
+                    who.push(e);
+                }
+            }
+            let who = if who.is_empty() { "nobody (the message has no sender's address)".to_string() } else { some(&who, 12) };
+            if id == "junk.blockSender" {
+                format!("add {who} to the Blocked Senders, whose new mail goes to Junk E-mail, and move {} there", messages_text(s, &ids))
+            } else {
+                format!("add {who} to the Safe Senders, whose new mail is never treated as junk{}", junk_beside_said(s, id, params))
+            }
+        }
+        "junk.add" | "junk.remove" => {
+            // The list as the command reads it; [`check`] refuses a call that names neither.
+            let list = match p::str(params, "list").and_then(mailcraft_model::JunkList::parse) {
+                Some(mailcraft_model::JunkList::Blocked) => "Blocked Senders",
+                Some(mailcraft_model::JunkList::Safe) => "Safe Senders",
+                None => return format!("run \u{201c}{label}\u{201d} ({id}) on a list that is neither Safe Senders nor Blocked Senders"),
+            };
+            let entry = mailcraft_model::junk_entry(st("entry")).unwrap_or_else(|| clip(st("entry"), 80));
+            let of = crate::cmd::junk::list_account(s, params)
+                .ok()
+                .and_then(|a| s.mailbox.account(a))
+                .map(|a| format!(" of the account {}", quoted(&clip(if a.email.is_empty() { &a.name } else { &a.email }, 80))))
+                .unwrap_or_default();
+            let beside = junk_beside_said(s, id, params);
+            if id == "junk.add" {
+                format!("add {} to the {list}{of}{beside}", quoted(&entry))
+            } else {
+                format!("remove {} from the {list}{of}{beside}", quoted(&entry))
+            }
+        }
+        "account.add" => {
+            let to = crate::cmd::account::from_params(params)
+                .map(|a| crate::cmd::account::servers_text(&a))
+                .unwrap_or_else(|| "no valid server".to_string());
+            format!("add the account {}, which connects to {to}", clip(st("email"), 80))
+        }
+        "file.open" => format!("open the mailbox {} as the mailbox in view; its {}", clip(st("path"), 160), crate::cmd::file::servers_in(params)),
+        "ui.confirmServers" => {
+            let to: Vec<String> = s
+                .mailbox
+                .accounts
+                .iter()
+                .filter(|a| a.kind.has_server())
+                .take(10)
+                .map(|a| format!("{} ({})", clip(&a.email, 80), crate::cmd::account::servers_text(a)))
+                .collect();
+            format!("confirm the servers of the mailbox opened from a file, so that it connects to {}", to.join("; "))
+        }
+        "account.addSharedMailbox" => format!("open the shared mailbox {}", clip(st("address"), 80)),
+        "account.setSenderAddresses" => {
+            let a = p::id(params, "id")
+                .and_then(|a| s.mailbox.account(a))
+                .map_or_else(|| "an account that isn't there".to_string(), |a| clip(&a.email, 80));
+            let listed: Vec<String> = params
+                .get("addresses")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|x| {
+                            let email = plain(x.get("email").and_then(Value::as_str)?);
+                            // The name recipients see and the signature are part of what is asked.
+                            let name = x.get("displayName").and_then(Value::as_str).map(plain).filter(|n| !n.is_empty());
+                            let signature = x.get("signature").and_then(Value::as_str).map(plain).filter(|n| !n.is_empty());
+                            Some(match (name, signature) {
+                                (None, None) => email,
+                                (Some(n), None) => format!("{email} (shown as {n})"),
+                                (None, Some(g)) => format!("{email} (signature {g})"),
+                                (Some(n), Some(g)) => format!("{email} (shown as {n}, signature {g})"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if listed.is_empty() {
+                format!("replace the account {a}'s whole list of sender addresses with none, so that it sends from its own address only")
+            } else {
+                // Every one, in full: the owner is never asked about what they can't read.
+                format!("replace the account {a}'s whole list of sender addresses with: {}", listed.join(", "))
+            }
+        }
+        "calendar.openShared" => {
+            format!("open the calendar of {} (its events are read from that person's mailbox with the account's sign-in)", clip(st("address"), 80))
+        }
+        "calendar.subscribe" => {
+            // (The host alone: the rest of an address may hold a secret.)
+            let host = mailcraft_model::subscription::check_address(st("address")).map(|a| a.host).unwrap_or_default();
+            format!(
+                "subscribe to the calendar on the web at the host {} (its file is fetched from then on, every hour and on Send/Receive, and kept read-only under Other Calendars); the address is kept like a password",
+                clip(&host, 80)
+            )
+        }
+        "calendar.unsubscribe" => {
+            let named = p::id_strict(params, "id").ok().flatten().and_then(|c| s.mailbox.calendar(c)).map(|c| c.name.clone()).unwrap_or_default();
+            format!("unsubscribe from the calendar {} and remove it and its events from this computer", clip(&named, 80))
+        }
+        "calendar.subscriptionSettings" => {
+            let named = p::id_strict(params, "id").ok().flatten().and_then(|c| s.mailbox.calendar(c)).map(|c| c.name.clone()).unwrap_or_default();
+            format!(
+                "change how the subscribed calendar {} is kept up to date (how often it is fetched, or the address it is fetched from)",
+                clip(&named, 80)
+            )
+        }
+        "calendar.removeShared" => {
+            let named = p::id_strict(params, "id")
+                .ok()
+                .flatten()
+                .and_then(|c| s.mailbox.calendar(c))
+                .and_then(|c| mailcraft_model::remote::opened_address(&c.origin.id))
+                .unwrap_or_else(|| st("address").to_string());
+            format!("remove the calendar of {} opened by address, and its events from this computer", clip(&named, 80))
+        }
+        "calendar.hideListedCopy" => {
+            let address = clip(st("address"), 80);
+            if params.get("hide").and_then(Value::as_bool) == Some(false) {
+                format!("show again the copy of the calendar of the shared mailbox {address} that is listed under Shared Calendars")
+            } else {
+                format!(
+                    "hide the copy of the calendar of the shared mailbox {address} that is listed under Shared Calendars, and remove its events from this computer (the shared mailbox's own calendar stays)"
+                )
+            }
+        }
+        "account.removeSharedMailbox" => {
+            let a = p::id_strict(params, "id")
+                .ok()
+                .flatten()
+                .and_then(|a| s.mailbox.account(a))
+                .map(|a| a.email.clone())
+                .unwrap_or_else(|| st("address").to_string());
+            format!("close the shared mailbox {} and remove its mail from this computer", clip(&a, 80))
+        }
+        "account.graphSwitch" | "ui.switchToGraph" => {
+            let a = p::id(params, "account").and_then(|a| s.mailbox.account(a)).map(|a| clip(&a.email, 80)).unwrap_or_default();
+            match st("answer") {
+                "later" => format!("keep the account {a} on IMAP for now"),
+                "switchWithout" => format!(
+                    "switch the account {a} to Microsoft Graph now, leaving the changes that wait for its IMAP server in the copy of the mailbox kept beside it"
+                ),
+                _ => format!("switch the account {a} to Microsoft Graph (its mail is downloaded again; a copy of the mailbox is kept beside it)"),
+            }
+        }
+        "account.edit" | "account.remove" => {
+            let verb = if id == "account.edit" { "change" } else { "remove" };
+            let Some(account) = p::id(params, "id").and_then(|a| s.mailbox.account(a)) else {
+                return format!("{verb} an account that isn't there");
+            };
+            // An account with no address to show (a local mailbox) is called "Local mailbox", as
+            // File › Info and the window's question call it.
+            let a = match clip(&account.email, 80) {
+                email if email.is_empty() => "Local mailbox".to_string(),
+                email => email,
+            };
+            if id == "account.edit" {
+                let new = crate::cmd::account::edited(account, params);
+                let moved = new
+                    .as_ref()
+                    .map(|new| (crate::cmd::account::servers_text(account), crate::cmd::account::servers_text(new)))
+                    .filter(|(was, now)| was != now);
+                let rules = me_changes(s, id, params).map(|a| me_beside_said(s, a)).unwrap_or_default();
+                // Beside a rule that makes a category in Outlook alone (said after it, #661): why.
+                let reads = match (&new, me_changes(s, id, params)) {
+                    (Some(new), Some(_)) if rules.is_empty() && makes_in_outlook(s, id, params).is_some() => {
+                        format!("; its address changes to {}, which a rule for its mail reads (\"sent to me\", say)", quoted(&clip(&new.email, 80)))
+                    }
+                    _ => String::new(),
+                };
+                let mut text = match moved {
+                    Some((was, now)) => format!("change the account {a}; its servers change from {was} to {now}"),
+                    None => format!("change the account {a}"),
+                };
+                // The tick of a relay that takes mail without a sign-in (#836) is named: it decides
+                // whether the password is shown to the outgoing server.
+                match new.map(|new| new.outgoing_without_sign_in) {
+                    Some(true) if !account.outgoing_without_sign_in => {
+                        text.push_str("; the outgoing server needs no sign-in (the password is never sent to it)");
+                    }
+                    Some(false) if account.outgoing_without_sign_in => text.push_str("; MailCraft signs in to the outgoing server again"),
+                    _ => {}
+                }
+                text.push_str(&rules);
+                text.push_str(&reads);
+                return text;
+            }
+            // The only account leaves an empty mailbox, as at a first start (#313); the shared
+            // mailboxes opened through it go with it. The placeholder of an empty mailbox isn't
+            // removed (the command says so), so it isn't said to leave one.
+            let only = s.mailbox.placeholder() != Some(account.id)
+                && s.mailbox.accounts.iter().all(|x| x.id == account.id || x.shared_of == Some(account.id));
+            if only { format!("remove the account {a} (the only account: leaves an empty mailbox)") } else { format!("remove the account {a}") }
+        }
+        // The one question for keeping in step with Outlook (#661), which the older ids put too:
+        // Microsoft's page, for everything it covers. (`account` read as the window reads it.)
+        // (The shared mailbox's and the shared calendars' ids put it too, for the account the mailbox
+        // is opened through: the page is that account's.)
+        "ui.allowSync" | "ui.allowTasks" | "ui.allowRules" | "ui.allowAutomaticReplies" | "ui.allowSharedSend" | "ui.allowSharedCalendars" => {
+            let Some(account) = params
+                .get("account")
+                .and_then(Value::as_u64)
+                .and_then(|a| s.mailbox.owner_of(a).map(|owner| owner.id).or(Some(a)))
+                .and_then(|a| s.mailbox.account(a))
+            else {
+                return "ask for permission to keep an account that isn't there in step with Outlook".to_string();
+            };
+            let what = if s.mailbox.keeps_rules(account.id) {
+                "the tasks, rules, automatic replies and categories"
+            } else {
+                "the tasks and automatic replies"
+            };
+            format!(
+                "open Microsoft's page in the browser to ask for permission to keep {what} of {} in step with Outlook: MailCraft may then change its To Do lists and its mailbox settings, read and send mail from the shared mailboxes and read the calendars shared with it, and change shared mail and calendars where the owner has write access",
+                clip(account.email.trim(), 80)
+            )
+        }
+        _ => run_text(label, id, params),
+    }
+}
+
+/// What a command that starts another message being written does (beside those open, #286).
+fn starting_text(s: &Session, id: &str, params: &Value) -> Option<String> {
+    let message = |m: Option<Id>| m.and_then(|m| s.mailbox.message(m)).map(|m| quoted(&m.subject)).unwrap_or_else(|| "(none selected)".to_string());
+    let one = || message(p::message_strict(params).ok().and_then(|m| m.or(s.sel.focus())));
+    let several = || messages_text(s, &p::ids_strict(params).map(|m| m.unwrap_or_else(|| s.sel.messages.clone())).unwrap_or_default());
+    let contact = || {
+        let c = p::id_strict(params, "id").ok().and_then(|c| c.or(s.sel.contact)).and_then(|c| s.mailbox.contact(c));
+        c.map(|c| quoted(&c.name())).unwrap_or_else(|| "(none selected)".to_string())
+    };
+    Some(match id {
+        "mail.new" => "start a new message".to_string(),
+        "mail.reply" => format!("reply to {}", one()),
+        "mail.replyAll" => format!("reply to all on {}", one()),
+        "mail.replyAndDelete" => format!("reply to {} and move it to Deleted Items", one()),
+        "mail.forward" => format!("forward {}", several()),
+        "mail.forwardAsAttachment" => format!("forward {} as attachments", several()),
+        "mail.editDraft" => format!("open the draft {}", one()),
+        "mail.resend" => format!("open {} again as a new message to send", one()),
+        "compose.undoSend" => "take back the message just sent and open it again to write".to_string(),
+        "people.email" => format!("start a new message to the contact {}", contact()),
+        "calendar.email" => "start a new message with a summary of the owner's calendar".to_string(),
+        "calendar.contactAttendees" => format!("start a new message to the people of {}", event_title(s, id, params)),
+        "calendar.respondEmail" => format!("start a new message to the organizer of {}", event_title(s, id, params)),
+        "people.forward" => format!("start a new message with the contact {} attached", contact()),
+        "tasks.statusReport" => {
+            let t = p::id_strict(params, "id").ok().and_then(|t| t.or(s.sel.task)).and_then(|t| s.mailbox.task(t));
+            format!("start a new message about the task {}", t.map(|t| quoted(&t.title)).unwrap_or_else(|| "(none selected)".to_string()))
+        }
+        _ => return None,
+    })
+}
+
+/// What Close Message does to the message being written it closes, and what becomes of that
+/// message (#494).
+fn leaving_text(s: &Session, params: &Value) -> String {
+    let writing = writing(s, params);
+    // Saved as it is, it stays in Drafts as it was saved, `discard` or not.
+    let c = s.compose_named(params);
+    let saved = c.is_some_and(|c| !unsaved_message(s, c));
+    // In Drafts as it is, but only by the background saves (#286): kept when it is closed, thrown
+    // away with `discard`.
+    let kept = c.is_some_and(|c| !c.dirty && !draft_gone(s, c));
+    let then = if kept { "it stays in Drafts as it was last saved" } else { "what isn't saved of it goes to Drafts first" };
+    let autosaved = c.is_some_and(|c| c.autosaved);
+    if p::bool(params, "discard") == Some(true) && autosaved {
+        format!("close the message {writing} without saving it: it will be thrown away, with the copy saved by itself in Drafts")
+    } else if p::bool(params, "discard") == Some(true) && !saved {
+        format!("close the message {writing} without saving what the owner wrote in it")
+    } else {
+        format!("close the message {writing} that the owner is writing; {then}")
+    }
+}
+
+/// The message being written that a call acts on (`compose`, else the current one), as a
+/// question names it: its subject, and which of several it is when more than one is open (#286).
+fn writing(s: &Session, params: &Value) -> String {
+    let Some(c) = s.compose_named(params) else { return "being written".to_string() };
+    let subject = if c.subject.trim().is_empty() { "(no subject)".to_string() } else { quoted(&c.subject) };
+    if s.composing_count() > 1 { format!("{subject} (message being written {})", c.id) } else { subject }
+}
+
+/// A dialog with changes that aren't saved, which the command closes or opens another in place
+/// of (#494), as the window named it (`unsaved`).
+fn form_text(id: &str, params: &Value) -> String {
+    let (item, many) = unsaved_item(params);
+    match id {
+        "ui.dialog" => {
+            format!("open the dialog {} in place of {item}, without saving the changes made in it", quoted(p::str(params, "name").unwrap_or("")))
+        }
+        _ => format!("close {item} without saving the changes made in {}", if many { "them" } else { "it" }),
+    }
+}
+
+/// The item with changes that aren't saved, as the window named it (`unsaved`), and whether
+/// more windows than its own are named.
+fn unsaved_item(params: &Value) -> (String, bool) {
+    let field = |k: &str| params.get("unsaved").and_then(|u| u.get(k)).and_then(Value::as_str).unwrap_or("");
+    let kind = match field("form") {
+        kind @ ("appointment" | "meeting" | "contact" | "task" | "message") => kind,
+        _ => "item",
+    };
+    let title = clip(field("title"), 80);
+    let mut item = if title.is_empty() { format!("the {kind}") } else { format!("the {kind} \u{201c}{title}\u{201d}") };
+    // Windows: how many more it closes with changes that aren't saved.
+    let more = params.get("unsaved").and_then(|u| u.get("more")).and_then(Value::as_u64).unwrap_or(0);
+    if more > 0 {
+        item.push_str(&format!(" and {}", plural(usize::try_from(more).unwrap_or(usize::MAX), "{n} more window", "{n} more windows")));
+    }
+    (item, more > 0)
+}
+
+/// A command and its params, as they came.
+fn run_text(label: &str, id: &str, params: &Value) -> String {
+    let mut shown = params.to_string();
+    if shown == "{}" || shown == "null" {
+        shown.clear();
+    }
+    // In full: `check` refuses what is too long to show, rather than a cut hiding the end.
+    let shown = if shown.is_empty() { String::new() } else { format!(" {}", plain(&shown)) };
+    format!("run \u{201c}{label}\u{201d} ({id}){shown}")
+}
+
+/// Said of a category that to-dos in a list shared with other people have.
+const SHARED_CATEGORY: &str = ", which to-dos in a To Do list shared with other people have: they see the change";
+
+/// Said of a to-do in a list shared with other people.
+const SHARED_TASK: &str = ", which is in a To Do list shared with other people: they see the change";
+
+/// A rule as it would be made, in words, naming the folders by their paths.
+fn rule_words(s: &Session, r: &mailcraft_model::Rule) -> String {
+    let addresses = s.mailbox.rule_reads_addresses(r);
+    let when = r.conditions.iter().map(|c| plain(&c.describe_as(addresses))).collect::<Vec<_>>().join(" and ");
+    let except = r.exceptions.iter().map(|c| plain(&c.describe_as(addresses))).collect::<Vec<_>>().join(" or ");
+    let mut then: Vec<String> = r
+        .actions
+        .iter()
+        .map(|a| match a {
+            mailcraft_model::Action::MoveTo(f) | mailcraft_model::Action::CopyTo(f) if s.mailbox.folder(*f).is_some() => {
+                let verb = if matches!(a, mailcraft_model::Action::CopyTo(_)) { "copy" } else { "move" };
+                // From the rule's account, as the gate reads it: a rule of one account filing into
+                // its own folders puts nothing on another server.
+                match folder_onto_server(s, *f, one_account(r)).and_then(|a| s.mailbox.account(a)) {
+                    Some(a) => format!("{verb} it onto the server of {}, into {}", clip(&a.email, 80), plain(&s.mailbox.folder_path(*f))),
+                    None => format!("{verb} it to {}", plain(&s.mailbox.folder_path(*f))),
+                }
+            }
+            mailcraft_model::Action::MoveTo(_) => "move it to a folder that is gone".to_string(),
+            mailcraft_model::Action::CopyTo(_) => "copy it to a folder that is gone".to_string(),
+            other => plain(&other.describe()),
+        })
+        .collect();
+    if r.alert {
+        then.push("show a desktop alert".to_string());
+    }
+    if let Some(server) = r.server.as_ref().filter(|s| !s.unknown.is_empty()) {
+        then.push(format!("and more that MailCraft can't show ({})", some(&server.unknown, 6)));
+    }
+    let then = then.join(", ");
+    if except.is_empty() { format!("when {when}: {then}") } else { format!("when {when}, except if {except}: {then}") }
+}
+
+fn rule_text(s: &Session, params: &Value) -> String {
+    match crate::cmd::rules::rule_from_params(s, params) {
+        Ok(r) if r.keep == mailcraft_model::Keep::Server => {
+            let on = s.mailbox.account(r.account).map(|a| quoted(&plain(&a.email))).unwrap_or_default();
+            format!(
+                "create the rule {}, kept on the server of {on} where it runs whether MailCraft is open or not: {}",
+                quoted(&r.name),
+                rule_words(s, &r)
+            )
+        }
+        Ok(r) => format!("create the rule {}{}: {}", quoted(&r.name), whose(s, r.account), rule_words(s, &r)),
+        Err(_) => "create a rule that can't be made as asked".to_string(),
+    }
+}
+
+/// Whose mail a rule is for, as the Rules dialog shows it: an account with no address by its
+/// name; a rule from before rules had accounts is for every account's.
+fn whose(s: &Session, account: Id) -> String {
+    match s.mailbox.account(account) {
+        Some(a) if !a.email.is_empty() => format!(" for the mail of {}", quoted(&plain(&a.email))),
+        Some(a) if !a.name.trim().is_empty() => format!(" for the mail of {}", quoted(&clip(&a.name, 80))),
+        None if account == 0 => " for the mail of every account".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; "),
+        _ => String::new(),
+    }
+}
+
+/// What a command did that its grant didn't cover: mail put into an Outbox (it would be sent),
+/// or messages gone for good. Checked by [`Session::run`](crate::Session::run) for agents.
+pub(crate) fn overstep(before: &Mailbox, after: &Mailbox, allow: &[Class]) -> Option<Class> {
+    if !allow.contains(&Class::Send) {
+        let outboxes: Vec<Id> = after.folders.iter().filter(|f| f.kind == FolderKind::Outbox).map(|f| f.id).collect();
+        if !outboxes.is_empty() {
+            let new_out = after
+                .messages
+                .iter()
+                .any(|(id, m)| outboxes.contains(&m.folder) && !before.messages.get(id).is_some_and(|b| outboxes.contains(&b.folder)));
+            if new_out {
+                return Some(Class::Send);
+            }
+        }
+    }
+    if !allow.contains(&Class::Delete) {
+        // Drafts are left out here: `edit.undo` and `edit.redo` refuse earlier, drafts too (#473).
+        let gone = before.messages.iter().any(|(id, m)| !m.draft && !after.messages.contains_key(id));
+        if gone {
+            return Some(Class::Delete);
+        }
+    }
+    if !allow.contains(&Class::Send) {
+        // A change that makes the server write to people, which the mailbox didn't have.
+        let new = after.event_changes.iter().filter(|c| c.send).any(|c| {
+            !before.event_changes.iter().any(|b| b.send && b.account == c.account && b.kind == c.kind && b.event == c.event && b.token == c.token)
+        });
+        if new {
+            return Some(Class::Send);
+        }
+        // A to-do in a list shared with other people, changed by whatever path.
+        if changes_shared_tasks(before, after) {
+            return Some(Class::Send);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_command_has_a_class() {
+        let s = Session::empty();
+        let missing: Vec<&str> = s.registry.all().iter().map(|c| c.id).filter(|id| access(id).is_none()).collect();
+        assert!(missing.is_empty(), "classify these for agents in crates/engine/src/agent.rs: {missing:?}");
+        // Each id in one list only.
+        let lists = [SAFE, SEND, DELETE, ACCOUNTS, MAILBOX, SETTINGS, NEVER];
+        let mut all: Vec<&str> = lists.iter().flat_map(|l| l.iter().copied()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "an id is in two lists");
+        // Every file param is a registered command's, or one of the window's own (`ui.*`).
+        for (id, ..) in FILE_PARAMS {
+            assert!(s.registry.get(id).is_some() || id.starts_with("ui."), "{id}");
+        }
+    }
+
+    #[test]
+    fn what_needs_the_owner() {
+        let mut s = Session::new(crate::sample::mailbox(1_791_993_600, 0));
+        for (id, want) in [
+            ("compose.send", Access::Owner(Class::Send)),
+            ("account.add", Access::Owner(Class::Accounts)),
+            ("mail.deletePermanently", Access::Owner(Class::Delete)),
+            ("file.open", Access::Owner(Class::Mailbox)),
+            ("rules.add", Access::Owner(Class::Settings)),
+            ("rules.list", Access::Owner(Class::Settings)),
+            ("sync.apply", Access::Never),
+            ("mail.flag", Access::Safe),
+            ("nope.nothing", Access::Never),
+        ] {
+            assert_eq!(classify(&s, id, &json!({})), want, "{id}");
+        }
+        assert_eq!(classify(&s, "calendar.respond", &json!({"response": "accept", "send": true})), Access::Owner(Class::Send));
+        assert_eq!(classify(&s, "calendar.respond", &json!({"response": "accept"})), Access::Safe);
+        // The review of a server's certificate makes a network contact; the Exchange page waits for Connect.
+        assert_eq!(classify(&s, "ui.dialog", &json!({"name": "account", "id": 3, "page": "certificate"})), Access::Owner(Class::Accounts));
+        assert_eq!(classify(&s, "ui.dialog", &json!({"name": "account", "page": "exchange", "email": "ada@example.org"})), Access::Safe);
+        let outbox = s.mailbox.folders.iter().find(|f| f.kind == FolderKind::Outbox).map(|f| f.id);
+        if let Some(outbox) = outbox {
+            assert_eq!(classify(&s, "mail.move", &json!({"folder": outbox, "ids": [1]})), Access::Owner(Class::Send));
+        }
+        // A message in Deleted Items goes for good.
+        let deleted = s.mailbox.folders.iter().find(|f| f.kind == FolderKind::Deleted).map(|f| f.id).unwrap();
+        let id = *s.mailbox.messages.keys().next().unwrap();
+        s.mailbox.move_message(id, deleted).unwrap();
+        assert_eq!(classify(&s, "mail.delete", &json!({"ids": [id]})), Access::Owner(Class::Delete));
+        // Paths are refused whatever the class.
+        assert!(matches!(check(&s, "file.exportMessage", &json!({"path": "/tmp/x.eml"}), &Class::ALL), Verdict::Refuse(_)));
+        assert!(matches!(check(&s, "compose.attach", &json!({"path": "/etc/passwd"}), &Class::ALL), Verdict::Refuse(_)));
+        assert_eq!(check(&s, "folder.select", &json!({"path": "Inbox"}), &[]), Verdict::Run);
+        assert!(matches!(check(&s, "compose.send", &json!({}), &[]), Verdict::Ask(Class::Send, _)));
+        assert_eq!(check(&s, "compose.send", &json!({}), &[Class::Send]), Verdict::Run);
+    }
+
+    #[test]
+    fn the_question_says_what_and_to_whom() {
+        let mut s = Session::empty();
+        s.run("mail.new", &json!({"to": "someone@attacker.example", "subject": "Re: Invoice"})).unwrap();
+        s.run("compose.attach", &json!({"name": "id_ed25519", "data": "AAAA"})).unwrap();
+        let d = describe(&s, "compose.send", &json!({}));
+        assert!(d.contains("Re: Invoice") && d.contains("someone@attacker.example") && d.contains("1 attachment (id_ed25519)"), "{d}");
+    }
+
+    #[test]
+    fn agents_cant_slip_mail_into_the_outbox_or_delete_for_good() {
+        let mut s = Session::new(crate::sample::mailbox(1_791_993_600, 0));
+        let outbox = s.mailbox.folders.iter().find(|f| f.kind == FolderKind::Outbox).map(|f| f.id).unwrap();
+        let id = *s.mailbox.messages.keys().next().unwrap();
+        let before = s.mailbox.clone();
+        s.agent = Some(Vec::new());
+        assert!(s.run("mail.copy", &json!({"folder": outbox, "ids": [id]})).is_err());
+        assert!(s.run("mail.deletePermanently", &json!({"ids": [id]})).is_err());
+        assert!(s.mailbox == before, "nothing changed");
+        s.agent = Some(vec![Class::Delete]);
+        assert!(s.run("mail.deletePermanently", &json!({"ids": [id]})).is_ok());
+        s.agent = None;
+    }
+}

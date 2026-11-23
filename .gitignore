@@ -1,0 +1,35 @@
+*~
+plan/
+/target
+/dist
+/corpus
+/log
+.DS_Store
+/.claude/
+/target-*/
+/craft-fonts/
+
+# Rust build output for the native bridge (any nested target/ dir)
+native/ohos-bridge/target/
+native/ohos-bridge/target-*/
+
+# ---- HarmonyOS / DevEco build artifacts & signing material (never commit) ----
+# 229 MB native bridge static lib (rebuild via build_native.sh)
+apps/mailcraft-ohos/entry/libs/
+# HAP build output (entry-default-{signed,unsigned}.hap, 359 MB)
+apps/mailcraft-ohos/entry/build/
+# Native CMake build cache
+apps/mailcraft-ohos/entry/.cxx/
+# OHOS dependency & IDE caches
+apps/mailcraft-ohos/oh_modules/
+apps/mailcraft-ohos/entry/oh_modules/
+apps/mailcraft-ohos/.hvigor/
+apps/mailcraft-ohos/.idea/
+# Real signing profile (cert/p7b/p12 + passwords) — keep out of git
+apps/mailcraft-ohos/build-profile.local.json5
+# Debug screenshots & logs
+hmlogs/
+
+# Upstream CI workflows (Android/Linux/release/fuzz) are irrelevant to the HarmonyOS port
+# and the port token lacks workflow scope; distributed via the port repo only.
+.github/workflows/
