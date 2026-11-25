@@ -363,6 +363,12 @@ pub fn run(rx: Receiver<crate::Message>, ctx: egui::Context) {
     let dpr = if dpr > 0.0 { dpr } else { 1.0 };
     log::info!("mailcraft render thread dpr={dpr}");
 
+    // Pending pointer/key events (touch, keys) that arrived since the last painted frame. egui
+    // 0.37 only consumes events from the `RawInput` handed to `run_ui`, so we accumulate them
+    // here and drain them into that frame's `raw.events` (see the `Frame` arm). Without this
+    // buffer the events were written into the Context's *old* input state and silently dropped.
+    let mut pending_input: Vec<egui::Event> = Vec::new();
+
     loop {
         match rx.try_recv() {
             Ok(crate::Message::Attach(window, width, height)) => {
@@ -394,6 +400,11 @@ pub fn run(rx: Receiver<crate::Message>, ctx: egui::Context) {
                     viewport_id,
                     ..Default::default()
                 };
+                // egui 0.37 only reads pointer/keyboard events from THIS frame's `RawInput.events`
+                // (its `PointerState::begin_pass` iterates `new.events`, and the persisted events
+                // are replaced with `new.events`). So the touch/keys that arrived since the last
+                // frame are drained here into `raw.events` — the only place egui will see them.
+                raw.events = std::mem::take(&mut pending_input);
                 // egui 0.37 reads the device ratio from the input's viewport info, not from a
                 // one-shot `ctx.set_pixels_per_point`. Feed it here so the UI renders at the
                 // native resolution instead of looking half-sized on a >1-dpr screen.
@@ -418,7 +429,10 @@ pub fn run(rx: Receiver<crate::Message>, ctx: egui::Context) {
             }
             Ok(crate::Message::Input(input)) => {
                 log::info!("mailcraft input: {input:?}");
-                input::apply(&ctx, &input, dpr);
+                // Translate now, but defer consumption to the next frame: egui 0.37 only reads
+                // events from the `RawInput` passed to `run_ui`, so we buffer them and attach
+                // them to that frame's `raw.events` (see the `Frame` arm above).
+                pending_input.extend(input::to_events(&input, dpr));
             }
             // A programmatic command (a tap / menu press turned into an engine command): run it
             // on the UI's `MailApp` session. `execute` mutates the session (e.g. selects a

@@ -74,34 +74,40 @@ pub struct TouchPoint {
     pub pressed: bool,
 }
 
-/// Translate one input event into egui's `RawInput` and feed it to the Context.
+/// Translate one input event into a list of egui `Event`s, ready to be fed as a frame's input.
+///
+/// egui 0.37 consumes input events **only from the `RawInput` handed to `Context::run_ui`** —
+/// its `PointerState::begin_pass` iterates `new.events`, and `InputState::begin_pass` replaces
+/// the persisted `events` field with `new.events`. Stuffing events into the Context's *old*
+/// state via `input_mut` (the earlier approach) therefore never reaches the pointer and no click
+/// ever registered. So this returns the events for the render loop to attach to the next
+/// frame's `RawInput.events` (see `render.rs`).
 ///
 /// Coordinates are physical pixels; egui wants logical pixels, so divide by `scale`
 /// (the device pixel ratio, supplied by the NAPI layer at runtime).
-pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
+pub fn to_events(input: &Input, scale: f32) -> Vec<egui::Event> {
     let inv = 1.0 / scale.max(0.001);
-    let mut raw = ctx.input_mut(|i| i.clone());
-    raw.events.clear();
+    let mut events = Vec::new();
     match input {
         Input::Touch { points } => {
             for p in points {
                 let pos = egui::pos2(p.x * inv, p.y * inv);
                 if p.pressed {
-                    raw.events.push(egui::Event::PointerButton {
+                    events.push(egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
                         pressed: true,
                         modifiers: egui::Modifiers::NONE,
                     });
                 } else {
-                    raw.events.push(egui::Event::PointerButton {
+                    events.push(egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
                         pressed: false,
                         modifiers: egui::Modifiers::NONE,
                     });
                 }
-                raw.events.push(egui::Event::PointerMoved(pos));
+                events.push(egui::Event::PointerMoved(pos));
             }
         }
         Input::Pointer { action, button, x, y } => {
@@ -113,10 +119,10 @@ pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
             };
             let modifiers = egui::Modifiers::NONE;
             match action {
-                0 => raw.events.push(egui::Event::PointerButton { pos, button: btn, pressed: true, modifiers }),
-                1 => raw.events.push(egui::Event::PointerButton { pos, button: btn, pressed: false, modifiers }),
-                2 => raw.events.push(egui::Event::PointerMoved(pos)),
-                3 => raw.events.push(egui::Event::PointerGone),
+                0 => events.push(egui::Event::PointerButton { pos, button: btn, pressed: true, modifiers }),
+                1 => events.push(egui::Event::PointerButton { pos, button: btn, pressed: false, modifiers }),
+                2 => events.push(egui::Event::PointerMoved(pos)),
+                3 => events.push(egui::Event::PointerGone),
                 _ => {}
             }
         }
@@ -129,10 +135,10 @@ pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
                 ..Default::default()
             };
             if !text.is_empty() && *action == 1 {
-                raw.events.push(egui::Event::Text(text.clone()));
+                events.push(egui::Event::Text(text.clone()));
             }
             if let Some(k) = key {
-                raw.events.push(egui::Event::Key {
+                events.push(egui::Event::Key {
                     key: k,
                     physical_key: None,
                     pressed: *action == 1,
@@ -144,7 +150,7 @@ pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
         Input::Axis { action, x, y, dx, dy, zoom } => {
             if *action == 2 {
                 let _pos = egui::pos2(*x * inv, *y * inv);
-                raw.events.push(egui::Event::MouseWheel {
+                events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(*dx, *dy),
                     modifiers: egui::Modifiers::NONE,
@@ -155,21 +161,21 @@ pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
             let _zoom = zoom;
         }
         Input::Blur => {
-            raw.events.push(egui::Event::PointerGone);
+            events.push(egui::Event::PointerGone);
         }
         Input::Focus => {}
         Input::Tap { x, y } => {
             // A click at an egui point: move onto it, press, release. egui registers the click
             // on the release when a press was seen this frame.
             let pos = egui::pos2(*x, *y);
-            raw.events.push(egui::Event::PointerMoved(pos));
-            raw.events.push(egui::Event::PointerButton {
+            events.push(egui::Event::PointerMoved(pos));
+            events.push(egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             });
-            raw.events.push(egui::Event::PointerButton {
+            events.push(egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed: false,
@@ -177,9 +183,7 @@ pub fn apply(ctx: &egui::Context, input: &Input, scale: f32) {
             });
         }
     }
-    ctx.input_mut(|i| {
-        i.events = raw.events;
-    });
+    events
 }
 
 /// XComponent key code -> egui::Key (simplified; complements the char generation in bridge.cpp).
