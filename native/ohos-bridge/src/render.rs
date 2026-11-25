@@ -352,7 +352,11 @@ pub fn run(rx: Receiver<crate::Message>, ctx: egui::Context) {
     services.system_locale = crate::locale().map(|s| s.to_string());
     log::info!("mailcraft interface locale: {:?}", crate::locale());
     let mut mail_app = MailApp::new(session, services);
-    log::info!("mailcraft MailApp constructed (sample mailbox, sync wired)");
+    // Only a real phone uses the phone interface. ArkTS reports the device type (== 'phone') via
+    // `ohos_mailcraft_egui_set_phone` before init; a tablet / 2-in-1 PC keeps MailCraft's desktop
+    // layout. Overriding the crate default here is what fixes "a PC showing the phone UI".
+    mail_app.ui.phone_layout = crate::is_phone();
+    log::info!("mailcraft MailApp constructed (sample mailbox, sync wired); phone_layout={}", mail_app.ui.phone_layout);
 
     // High-DPI: the OHOS surface is in device pixels, egui lays out in points. egui 0.37 derives
     // the effective pixels-per-point as `zoom_factor * native_pixels_per_point`, and reads

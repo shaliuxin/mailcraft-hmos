@@ -1111,9 +1111,11 @@ impl Default for UiState {
             alert_new_mail: true,
             alert_reminders: true,
             imported_keys: Vec::new(),
-            // On HarmonyOS the window opens in the phone interface; on a desktop it stays the
-            // desktop layout (a narrow window still falls into the phone one by width).
-            phone_layout: cfg!(target_env = "ohos"),
+            // Default to the desktop layout everywhere. On HarmonyOS the bridge overrides this
+            // from the device type (`ohos_mailcraft_egui_set_phone`): a phone shows the phone
+            // interface, a tablet / 2-in-1 PC keeps the desktop one. On a desktop a narrow window
+            // still falls into the phone interface by width (see `phone::active`).
+            phone_layout: false,
         }
     }
 }

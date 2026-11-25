@@ -33,3 +33,7 @@ export const eguiTap: (x: number, y: number) => void;
 // mail.first / view.mail), so the session mutates and the next frame's reading pane reflects
 // it — without depending on pixel coordinates.
 export const eguiCommand: (id: string, params: string) => void;
+// Report whether this device is a phone (from `@ohos.deviceInfo.deviceType`). Call BEFORE
+// eguiInit so the render thread picks the right layout: a phone shows the phone interface, a
+// tablet / 2-in-1 PC keeps MailCraft's desktop interface.
+export const eguiSetPhone: (isPhone: boolean) => void;

@@ -46,6 +46,7 @@ extern "C" void ohos_mailcraft_egui_input(const uint8_t *ptr, size_t len);
 extern "C" void ohos_mailcraft_egui_active(bool active);
 extern "C" void ohos_mailcraft_egui_tap(float x, float y);
 extern "C" void ohos_mailcraft_egui_command(const char *id, const char *params);
+extern "C" void ohos_mailcraft_egui_set_phone(bool is_phone);
 
 // The Rust `log` crate's sink: wgpu / egui diagnostics only reach the device through hilog.
 extern "C" void ac_hilog(int32_t level, const char *message) {
@@ -248,6 +249,19 @@ static napi_value EguiActive(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
+// Report whether this device is a phone (from `@ohos.deviceInfo.deviceType`). Call before
+// `eguiInit` so the render thread, spawned by `eguiInit`, reads it and sets the UI's
+// `phone_layout`: a phone shows the phone interface, a tablet / 2-in-1 PC keeps the desktop UI.
+static napi_value EguiSetPhone(napi_env env, napi_callback_info info) {
+  size_t n = 1;
+  napi_value arg;
+  napi_get_cb_info(env, info, &n, &arg, nullptr, nullptr);
+  bool is_phone = false;
+  if (n) napi_get_value_bool(env, arg, &is_phone);
+  ohos_mailcraft_egui_set_phone(is_phone);
+  return Undefined(env);
+}
+
 // Self-test hook: a synthetic click at egui *point* coordinates (x, y are points, not device
 // pixels). Bypasses the XComponent → device-pixel routing so a tap proves click → select →
 // repaint regardless of window position on a multi-window HarmonyOS PC.
@@ -388,6 +402,7 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"eguiActive", nullptr, EguiActive, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"eguiTap", nullptr, EguiTap, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"eguiCommand", nullptr, EguiCommand, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"eguiSetPhone", nullptr, EguiSetPhone, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
 

@@ -468,6 +468,26 @@ fn current_scale() -> f32 {
     SCALE.load(Ordering::Relaxed) as f32 / 1000.0
 }
 
+/// Whether this device is a *phone*, reported by ArkTS from `@ohos.deviceInfo.deviceType`
+/// (== 'phone') before `ohos_mailcraft_egui_init`. Only a phone defaults to the phone interface;
+/// a tablet / 2-in-1 PC keeps MailCraft's original desktop layout. Defaults to `false` (desktop)
+/// when ArkTS never reports it, so a missing probe degrades to the desktop UI, not the phone one.
+static IS_PHONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[allow(dead_code)]
+fn is_phone() -> bool {
+    IS_PHONE.load(Ordering::Relaxed)
+}
+
+/// Tell the bridge whether the device is a phone. ArkTS calls this **before**
+/// `ohos_mailcraft_egui_init`; the render thread reads it (via [`is_phone`]) to set the UI's
+/// `phone_layout` so a phone shows the Outlook-for-Android style interface and a tablet / 2-in-1
+/// PC shows the desktop interface.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ohos_mailcraft_egui_set_phone(is_phone: bool) {
+    IS_PHONE.store(is_phone, Ordering::Relaxed);
+    log::info!("mailcraft device is_phone={is_phone}");
+}
+
 /// Tell the render thread the XComponent surface appeared, on a given `window` handle.
 ///
 /// # Safety

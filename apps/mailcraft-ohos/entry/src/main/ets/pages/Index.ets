@@ -9,6 +9,7 @@ import entry from 'libentry.so';
 import { common } from '@kit.AbilityKit';
 import display from '@ohos.display';
 import i18n from '@ohos.i18n';
+import deviceInfo from '@ohos.deviceInfo';
 
 @Entry
 @Component
@@ -111,6 +112,28 @@ struct Index {
       console.info(`MC-RENDER: setLocale ${sysLocale} ${lr}`);
     } catch (err) {
       console.warn(`MC-RENDER: setLocale failed: ${(err as Error).message}`);
+    }
+    // Report the device type so the UI picks the right layout: a phone shows the Outlook-for-Android
+    // interface, a tablet / 2-in-1 PC keeps MailCraft's original desktop interface. Must run BEFORE
+    // eguiInit — the render thread (spawned by eguiInit) reads it to set the UI's phone_layout.
+    let isPhone = false;
+    try {
+      isPhone = deviceInfo.deviceType === 'phone';
+      console.info(`MC-RENDER: deviceType=${deviceInfo.deviceType} -> isPhone=${isPhone}`);
+    } catch (err) {
+      // If the device-type probe is somehow unavailable, fall back to a small-screen heuristic.
+      try {
+        const wvp = this.getUIContext().px2vp(display.getDefaultDisplaySync().width);
+        isPhone = wvp < 600;
+        console.warn(`MC-RENDER: deviceType probe failed, width heuristic isPhone=${isPhone}: ${(err as Error).message}`);
+      } catch (err2) {
+        console.warn(`MC-RENDER: device probe failed, defaulting isPhone=false: ${(err2 as Error).message}`);
+      }
+    }
+    try {
+      entry.eguiSetPhone(isPhone);
+    } catch (err) {
+      console.warn(`MC-RENDER: eguiSetPhone failed: ${(err as Error).message}`);
     }
     try {
       entry.eguiInit(scale, (message: string): void => {

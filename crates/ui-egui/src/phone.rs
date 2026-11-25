@@ -16,10 +16,15 @@ use crate::theme::{Tokens, regular, semibold};
 use crate::{icons, MailApp};
 use mailcraft_engine::Module;
 
-/// Whether the phone interface is in view: the window's own setting, or a window too narrow for
-/// the desktop's three columns.
+/// Whether the phone interface is in view: the window's own setting, or (on a desktop) a window
+/// too narrow for the desktop's three columns.
+///
+/// On HarmonyOS the choice is purely the device type — the bridge sets `phone_layout` from
+/// `deviceInfo.deviceType`, so a phone shows the phone UI and a tablet / 2-in-1 PC keeps the
+/// desktop UI regardless of window width (the width fallback is a desktop convenience only).
 pub fn active(app: &MailApp, ui: &egui::Ui) -> bool {
-    app.ui.phone_layout || ui.available_width() < 600.0
+    let width_fallback = !cfg!(target_env = "ohos") && ui.available_width() < 600.0;
+    app.ui.phone_layout || width_fallback
 }
 
 /// The app bar's height, and the tab bar's height.
