@@ -31,6 +31,33 @@ MailCraft follows the architecture and conventions of [WordCraft](https://github
 
 </div>
 
+> ## 鸿蒙（OpenHarmony / HarmonyOS）移植版
+>
+> **本仓库 `shaliuxin/mailcraft-hmos` 是 MailCraft 的鸿蒙移植版本（fork）**：在上游
+> [UCS-Care-Group/mailcraft](https://github.com/UCS-Care-Group/mailcraft) 的 Rust 核心之上，把它接到
+> OpenHarmony / HarmonyOS 设备上运行（真机手机 / 平板 / 2-in-1 PC）。上游的桌面
+> （Windows / macOS / Linux）与 Web 构建不受影响，行为与本文件其余部分描述一致。
+>
+> **当前版本**：v0.15.0（对齐上游 0.15.0）· bundleName `cn.shaliuxin.mailcraft` · 分支 `hmos`
+>
+> **架构链路**：
+> `ArkUI（Index.ets）→ NAPI（libentry.so）→ C ABI（libmailcraft_ohos_bridge）→ MailCraft 引擎 + egui 渲染`
+>
+> **主要改造点**：
+> - **NAPI 桥接 + C ABI**：`native/ohos-bridge`（Rust）把 MailCraft 引擎接到鸿蒙；`apps/mailcraft-ohos`（ArkUI + NAPI）承载界面。
+> - **egui → wgpu 渲染环**：在鸿蒙上做整条 egui 的 GPU 渲染（桌面三栏 / ribbon / 状态栏 + 手机布局）。
+> - **触摸 / 键输入**：把鸿蒙触摸事件翻译成 egui 事件并正确喂入渲染帧（适配 egui 0.37 的事件消费模型）。
+> - **手机 / 桌面双布局按设备类型启用**：仅当 `@ohos.deviceInfo.deviceType === 'phone'` 才用手机版界面；平板 / 2-in-1 PC 用原版桌面界面。
+> - **内置 CA 证书**：OHOS 无系统 CA 库，`crates/net` 在 `target_env = "ohos"` 下用 webpki-roots 做 TLS 证书校验。
+> - **Platform trait 实现**：`OhosPlatform` 提供沙箱密钥库、网络、OAuth 自定义 scheme 重定向等。
+> - **签名 / 打包**：DevEco 用本项目专属 bundleName 自动签名打 HAP。
+>
+> **交付（v0.15.0）**：源码在本仓库 `hmos` 分支；安装包见 GitHub
+> [Release v0.15.0](https://github.com/shaliuxin/mailcraft-hmos/releases/tag/v0.15.0) 的 `MailCraft-0.15.0-unsigned.hap`
+> （未签名，供第三方用自有证书重签后安装）。
+>
+> **详细移植记录与踩坑**：[apps/mailcraft-ohos/README.md](apps/mailcraft-ohos/README.md)
+
 ## What works today
 
 - **Mail:** accounts, nested folders and favourites, a virtualised message list grouped by date (or sender, importance), sort, filters, conversations, pinning, a reading pane (right, bottom or off) whose text you can select and copy, flags with due dates, colour categories, importance, junk and archive, move and copy (or drag onto a folder), two-step delete with a question before anything is gone for good, Send / Receive › Work Offline, and how far back each account keeps its mail in full on this computer (older mail keeps its headers and preview and comes down again when opened), flag and delete on the row under the pointer, a click on a row's left edge to switch read and unread, a double-click to open a message in a window of its own, drag accounts into the order you want, undo and redo for all of it.

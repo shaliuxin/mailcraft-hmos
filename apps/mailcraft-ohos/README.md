@@ -1,7 +1,23 @@
 # MailCraft for OpenHarmony — 最小链路空壳（apps/mailcraft-ohos）
 
-这是把 MailCraft 的 Rust 核心接到鸿蒙的第一条端到端链路：
-**ArkUI → NAPI(`libentry.so`) → C ABI(`libmailcraft_ohos_bridge`) → MailCraft 引擎**。
+这是把 MailCraft 的 Rust 核心接到鸿蒙的移植工程，已对齐上游 **v0.15.0**：
+**ArkUI → NAPI(`libentry.so`) → C ABI(`libmailcraft_ohos_bridge`) → MailCraft 引擎 + egui 渲染**。
+
+## 当前状态（v0.15.0，2026-11）
+
+早期文档里的「下一步」现已落地，下面这段是当前真机验证的现状。
+
+- **egui 三栏渲染（桌面布局）**：邮件 / 日历等模块已能用上桌面三栏 + ribbon + 状态栏，HTML 邮件由核心解析成 `blocks` 显示模型，UI 不自己解析 HTML。
+- **触摸 / 键输入（egui 0.37）**：把鸿蒙触摸事件翻译成 egui 事件，**正确喂入渲染帧的 `RawInput.events`**（适配 egui 0.37「只消费 `Context::run_ui(new_input,…)` 那一帧 `new.events`」的事件消费模型），真机上按钮 / 列表 / 弹窗点击均生效。
+  - 通用铁律：桥接**不能用 `ctx.input_mut` 把事件塞进旧状态**（会被下一帧 `new.events` 静默丢弃），必须翻译后交给 `raw.events`。
+- **手机 / 桌面双布局按设备类型启用**：`@ohos.deviceInfo.deviceType === 'phone'` 才用手机版界面（单栏 + drawer + tab bar）；平板 / 2-in-1 PC 用原版桌面界面。判定由 ArkTS 读设备类型、经 NAPI `eguiSetPhone` 透传给桥接原子量，render 线程据此设 `phone_layout`。**默认桌面**（探测失败也降级桌面）。
+  - 通用铁律：布局开关**绝不能用 `phone_layout: cfg!(target_env="ohos")` 做默认**（那会让所有鸿蒙设备都进手机界面），必须「ArkTS `deviceType==='phone'` → 桥接透传 → 运行时开关」且默认桌面。
+- **内置 CA 证书**（`crates/net`，`target_env="ohos"`）：OHOS 无系统 CA 库，改用 **webpki-roots**（Mozilla roots）做 TLS 校验；真机实测 IMAP 到 `imap.gmail.com:993` 的 TLS 握手成功、被服务器以「凭证无效」拒绝（即通路、网络、TLS 端到端验证通过）。
+- **Platform trait 实现**：`OhosPlatform` 提供文件型沙箱密钥库、`network=Online`、OAuth `CustomScheme("mailcraft")` 重定向。
+- **交付**：源码在本仓库 `hmos` 分支；v0.15.0 安装包见 GitHub [Release v0.15.0](https://github.com/shaliuxin/mailcraft-hmos/releases/tag/v0.15.0)。
+  注意：DevEco 自动签名的 Profile 绑定构建机设备 UDID，**第三方设备请用 unsigned 包自有证书重签**。
+
+## 关键坑（移植记录）
 
 ## 架构
 
